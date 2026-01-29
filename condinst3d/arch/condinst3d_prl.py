@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Tuple, Optional, Literal, Sequence, Union
+from typing import Any, Dict, List, Tuple, Optional, Literal, Sequence, Union, Iterable
 from torch.utils.data import DataLoader
 import torch
 import torch.nn as nn
@@ -6,40 +6,41 @@ import torch.nn.functional as F
 from torch import Tensor
 from monai.data import MetaTensor
 from monai.transforms import Compose
+from monai.transforms.utils import get_unique_labels
 import pytorch_lightning as pl
 import torchmetrics
 from lightning.pytorch.utilities.types import STEP_OUTPUT, OptimizerLRScheduler
 import random
 import numpy as np
-import matplotlib.pyplot as plt
 
 from omegaconf import DictConfig, OmegaConf
 from hydra.utils import instantiate
 from condinst3d.arch.heads import ClassificationHead, ControllerHead, DynamicMaskHead
 from condinst3d.evaluator.metrics import AveragePrecision, DetectionConfusionMatrix
-from condinst3d.utils.detection import ImageInstancesData, InstanceList
+from condinst3d.evaluator.iou import mask_intersection_over_union, box_intersection_over_union
+from condinst3d.utils.detection import (ImageInstancesData, InstanceList, get_onehot_instance_mask_boxes,
+                                        priority_based_onehot_to_instance_mask, instance_mask_to_onehot,
+                                        onehot_to_instance_mask)
+from condinst3d.utils.mask import relabel_sequential
 from condinst3d.utils.anchors import AnisotropicATSSMatcher, generate_3d_anchors
 from condinst3d.arch.backbone.abstract import AbstractBackbone
-from condinst3d.utils.spatial import aligned_trilinear
+from condinst3d.utils.spatial import aligned_trilinear, merge_patch_logits_per_instance, get_patch_spatial_shapes
+from condinst3d.utils.bached_ag import batched_nms, batched_lbe
+from condinst3d.visualization.utils import get_stats
+from condinst3d.visualization.list_instance_boxseg_visualizer import ListInstanceBoxSegSliceVisualizer
+from condinst3d.evaluator.metrics.cfm_based import compute_precision, compute_fi, compute_recall
+from monai.transforms import Lambda
 
-# from deepnets.utils.detection import (
-#     batched_nms, relabel_sequential, get_unique_labels, instance_mask_to_onehot,
-#     onehot_to_instance_mask, priority_based_onehot_to_instance_mask,
-#     generate_3d_anchors, get_instance_segmentation_centerness,
-#     onehot_instance_mask_get_axial_eccentricity, batched_lbe
-# )
-# from deepnets.visualization.list_instance_boxseg_visualizer import ListInstanceBoxSegSliceVisualizer
-# from deepnets.losses import *
-# from deepnets.utils.evaluation import (
-#     mask_intersection_over_union, get_stats,
-#     compute_precision, compute_recall, compute_fi
-# )
-# from deepnets.utils.basic import aligned_trilinear, filter_dictionary_of_tensors, patch_tensor_concat
-# from deepnets.utils.postprocessing import (
-#     OnehotInstanceMaskPixelsAxialThreshold,
-#     OnehotInstanceMaskEccentricityAxialThreshold, ConnectDisconnectedSlices,
-#     AxialKeepLargestConnectedComponent
-# )
+
+# ---------------- Metric logging helpers ----------------
+def _to_float(x: Tensor | float) -> Tensor | float:
+    # keep tensors as tensors (Lightning likes tensors), but avoid accidental MetaTensor issues
+    return x
+
+
+def _safe_mean(x: Tensor) -> Tensor:
+    # some AP implementations return shape [T] or [T, ...]
+    return x.mean() if x.numel() else x.new_tensor(0.0)
 
 
 class CondInst3dPRL(pl.LightningModule):
@@ -89,10 +90,10 @@ class CondInst3dPRL(pl.LightningModule):
         }
 
         # -------------------- postproc params --------------------
-        self.postproc_transform = None
+        postproc_transforms = [Lambda(func=lambda x: x)]
         if "postproc" in cfg and cfg.postproc is not None:
-            transforms = [instantiate(t) for t in cfg.postproc.transforms]
-            self.postproc_transform = Compose(transforms)
+            postproc_transforms += [instantiate(t) for t in cfg.postproc.transforms]
+        self.postproc_transform = Compose(postproc_transforms)
 
         # -------------------- inference/matching hyperparams --------------------
         self.inference_hyperparams = {}
@@ -104,15 +105,19 @@ class CondInst3dPRL(pl.LightningModule):
             "test": self._generate_metrics(cfg.evaluation),
         })
 
-        # # -------------------- visualization --------------------
-        # img_channels = modalities + list(mcfg.visualization.extra_img_channels)
-        # self.instance_head_visualizer = instantiate(
-        #     cfg.visualization.instance_head_visualizer,
-        #     img_channels=img_channels,
-        #     channel_seg_under_image=freqmap_index,
-        # )
-        # self.images_to_visualize: Dict[int, List[int]] = {}
-        # self.num_images_to_show = int(mcfg.visualization.num_images_to_show)
+        # -------------------- visualization --------------------
+        img_channels = cfg.visualization.img_channels
+        self.instance_head_visualizer = ListInstanceBoxSegSliceVisualizer(
+            crop_size=cfg.visualization.crop_size,
+            pred_seg_is_binary=False,
+            draw_boxes=False,
+            show_slices=cfg.visualization.show_slices,
+            figsize=cfg.visualization.figsize,
+            img_channels=img_channels,
+            channel_seg_under_image=cfg.visualization.channel_seg_under_image,
+        )
+        self.images_to_visualize: Dict[int, List[int]] = {}
+        self.num_images_to_show = int(cfg.visualization.num_images_to_show)
 
     def _generate_metrics(self, eval_cfg: Dict):
         metrics = torchmetrics.MetricCollection({
@@ -125,7 +130,7 @@ class CondInst3dPRL(pl.LightningModule):
 
     def set_inference_params(self, infer_cfg: Dict):
         params = {
-            "mask_threshold": float(infer_cfg.mask_threshold),
+            "mask_thresh": float(infer_cfg.mask_thresh),
             "score_thresh": float(infer_cfg.score_thresh),
             "nms_thresh": float(infer_cfg.nms_thresh),
             "topk_candidates": int(infer_cfg.topk_candidates),
@@ -134,23 +139,43 @@ class CondInst3dPRL(pl.LightningModule):
         self.inference_hyperparams = params
 
     # ---------------- Viz helpers ----------------
-    def log_figure(self, name, figure):
-        if self.logger is not None:
-            self.logger.experiment.add_figure(name, figure, self.current_epoch)
+    def _get_single_val_loader(self) -> DataLoader:
+        """You said you only have one val dataloader."""
+        val_loader = self.trainer.val_dataloaders
+        if isinstance(val_loader, list):
+            # take the first; you said only 1 exists
+            return val_loader[0]
+        return val_loader
 
-    def assign_images_to_visualize(self, seed=42):
-        if self.trainer.is_global_zero:
-            val_loader = self.trainer.val_dataloaders
-            if not isinstance(val_loader, list):
-                val_loader = [val_loader]
+    def _assign_images_to_visualize(self, seed: int = 42) -> None:
+        """
+        Pick a fixed set of batch indices to visualize from the (single) val dataloader.
+        Stores them in self.images_to_visualize[0] as a sorted list[int].
+        """
+        if not self.trainer or not self.trainer.is_global_zero:
+            return
 
-            for i, loader in enumerate(val_loader):
-                if self.num_images_to_show >= 0:
-                    num_images_to_show = min(self.num_images_to_show, len(loader))
-                    random.seed(seed)
-                    self.images_to_visualize[i] = random.sample(range(len(loader)), k=num_images_to_show)
-                else:
-                    self.images_to_visualize[i] = list(range(len(loader)))
+        loader = self._get_single_val_loader()
+
+        # If your loader doesn't have __len__ (iterable-style), just do nothing
+        if not hasattr(loader, "__len__"):
+            self.images_to_visualize = {0: []}
+            return
+
+        n_batches = len(loader)
+        if n_batches == 0:
+            self.images_to_visualize = {0: []}
+            return
+
+        if self.num_images_to_show < 0:
+            chosen = list(range(n_batches))
+        else:
+            k = min(int(self.num_images_to_show), n_batches)
+            rng = random.Random(seed)  # doesn't touch global RNG
+            chosen = rng.sample(range(n_batches), k=k)
+            chosen.sort()
+
+        self.images_to_visualize = {0: chosen}
 
     # ---------------- Matching / labels ----------------
     def _match_anchors_atss(
@@ -279,232 +304,355 @@ class CondInst3dPRL(pl.LightningModule):
         }
 
     # ---------------- Inference: detections + seg ----------------
-    def compute_detections(
-        self,
-        image_shape: Sequence[int],
-        outputs,
+    @torch.no_grad()
+    def _compute_detections(
+            self,
+            outputs: Dict[str, Tensor],
     ) -> Tuple[List[Dict[str, Tensor]], List[ImageInstancesData]]:
-        N, _, w, h, d = image_shape
+        """
+        outputs must contain:
+          - outputs["shape"] : (N, C, W, H, D) or similar
+          - outputs["features"] : list of feature tensors per level
+          - outputs["cls_logits"] : [N, A_total, num_classes] (A_total = sum A_l)
+        Returns:
+          detections: List[dict] length N (per-image)
+          per_image_instances: List[ImageInstancesData] length N
+        """
+        # ---- unpack ----
+        N = int(outputs["shape"][0])
         features = outputs["features"]
+        cls_logits = outputs["cls_logits"]  # [N, A_total, C]
+        device = cls_logits.device
 
-        anchors_all_levels = generate_3d_anchors(
-            image_shape,
+        score_thresh = float(self.inference_hyperparams["score_thresh"])
+        topk_candidates = int(self.inference_hyperparams["topk_candidates"])
+
+        # ---- anchors per level + flat anchors ----
+        anchors_per_level = generate_3d_anchors(
+            outputs["shape"],
             [f.shape for f in features],
             self.anchors_sizes,
-            device=self.device
-        )
-        num_anchors_per_level = [len(x) for x in anchors_all_levels]
-        num_anchors_cumsum = [0] + np.cumsum(num_anchors_per_level).tolist()
+            device=device,
+        )  # list[L] of [A_l, 6]
 
-        split_cls_logits = list(outputs["cls_logits"].split(num_anchors_per_level, dim=1))
+        num_anchors_per_level = [a.shape[0] for a in anchors_per_level]
+        level_offsets = torch.as_tensor(
+            np.cumsum([0] + num_anchors_per_level[:-1]),
+            device=device,
+            dtype=torch.long,
+        )  # [L]
+
+        anchors_cat = torch.cat(anchors_per_level, dim=0)  # [A_total, 6]
+
+        # ---- split logits by level (cheap view) ----
+        logits_by_level = list(cls_logits.split(num_anchors_per_level, dim=1))  # L items of [N, A_l, C]
+
         detections: List[Dict[str, Tensor]] = []
-        instance_list = []
+        per_image_instances: List[ImageInstancesData] = []
 
-        for index in range(N):
-            logits_per_image = [cl[index] for cl in split_cls_logits]
+        # ---- per image ----
+        for i in range(N):
+            img_scores_all: List[Tensor] = []
+            img_classes_all: List[Tensor] = []
+            img_keep_idxs_all: List[Tensor] = []
 
-            image_scores, image_classes = [], []
-            anchors_per_image_all_levels, anchor_idxs_all_levels = [], []
+            # ---- per level ----
+            for l, logits_l in enumerate(logits_by_level):
+                logits_l = logits_l[i]  # [A_l, C]
+                A_l, C = logits_l.shape
 
-            for l, (logits_per_level, anchors_per_level) in enumerate(zip(logits_per_image, anchors_all_levels)):
-                num_classes = logits_per_level.shape[-1]
+                # score definition (matches your code): sqrt(sigmoid)
+                # flatten so each anchor-class pair is a candidate
+                scores = torch.sigmoid(logits_l).sqrt().reshape(-1)  # [A_l*C]
 
-                scores_per_level = torch.sqrt(torch.sigmoid(logits_per_level)).flatten()
-                keep_idxs = scores_per_level > self.inference_hyperparams["score_thresh"]
-                scores_per_level = scores_per_level[keep_idxs]
-                topk_idxs = torch.where(keep_idxs)[0]
+                keep = scores > score_thresh
+                if not torch.any(keep):
+                    continue
 
-                num_topk = min(self.inference_hyperparams["topk_candidates"], topk_idxs.size(0))
-                scores_per_level, idxs = scores_per_level.topk(num_topk)
-                topk_idxs = topk_idxs[idxs]
+                keep_idx = torch.where(keep)[0]  # indices in [0, A_l*C)
+                keep_scores = scores[keep_idx]  # [K]
 
-                anchor_idxs = torch.div(topk_idxs, num_classes, rounding_mode="floor")
-                anchor_idxs_adjusted = anchor_idxs + num_anchors_cumsum[l]
-                classes_per_level = topk_idxs % num_classes
+                # top-k per level
+                k = min(topk_candidates, keep_idx.numel())
+                if k < keep_idx.numel():
+                    keep_scores, order = torch.topk(keep_scores, k, largest=True, sorted=False)
+                    keep_idx = keep_idx[order]
 
-                image_scores.append(scores_per_level)
-                image_classes.append(classes_per_level)
-                anchors_per_image_all_levels.append(anchors_per_level)
-                anchor_idxs_all_levels.append(anchor_idxs_adjusted)
+                # decode (anchor_idx, class_idx) from flattened index
+                anchor_idx = torch.div(keep_idx, C, rounding_mode="floor")  # [k] in [0..A_l-1]
+                class_idx = keep_idx.remainder(C)  # [k]
 
-            image_scores = torch.cat(image_scores, dim=0)
-            image_classes = torch.cat(image_classes, dim=0)
-            anchors_per_image_all_levels = torch.cat(anchors_per_image_all_levels, dim=0)
-            anchor_idxs_all_levels = torch.cat(anchor_idxs_all_levels, dim=0)
+                # map anchor indices to global (flattened across levels)
+                global_anchor_idx = anchor_idx + level_offsets[l]  # [k] in [0..A_total-1]
 
-            anchor_centers = (anchors_per_image_all_levels[:, :3] + anchors_per_image_all_levels[:, 3:]) / 2
-            anchor_strides = anchors_per_image_all_levels[:, 3:] - anchors_per_image_all_levels[:, :3]
+                img_scores_all.append(keep_scores)
+                img_classes_all.append(class_idx.to(torch.long))
+                img_keep_idxs_all.append(global_anchor_idx.to(torch.long))
 
-            instance_data = ImageInstancesData(
-                anchors_centers=anchor_centers,
-                anchors_strides=anchor_strides,
-                keep_idxs=anchor_idxs_all_levels,
-            )
-            instance_list.append(instance_data)
+            if len(img_keep_idxs_all) == 0:
+                # consistent empty outputs
+                empty_scores = torch.empty((0,), device=device, dtype=cls_logits.dtype)
+                empty_classes = torch.empty((0,), device=device, dtype=torch.long)
+                empty_keep = torch.empty((0,), device=device, dtype=torch.long)
 
-            detections.append({
-                "anchor_centers": instance_data.get_pos_points(),
-                "anchor_strides": instance_data.get_pos_strides(),
-                "classes": image_classes,
-                "scores": image_scores,
-            })
-
-        return detections, instance_list
-
-    def compute_detections_and_segmentations(self, inputs):
-        output_shape = self.get_out_shape(None)
-        out_h, out_w, out_d = output_shape
-        h, w, d = inputs.shape[-3:]
-        n_patches = 0
-
-        if h < out_h or w < out_w or d < out_d:
-            if inputs.ndim == 6:
-                batch_size, n_patches = inputs.shape[:2]
-            else:
-                batch_size = 1
-                n_patches = inputs.shape[0]
-            inputs = inputs.view(batch_size * n_patches, *inputs.shape[-4:])
-
-        outputs = self.forward(inputs)
-        detections, instance_data_list = self.compute_detections(inputs.shape, outputs)
-
-        instance_list = InstanceList(instance_data_list)
-        instance_logits = self.instance_segmentation_head(outputs["f_mask"], outputs["controller_logits"], instance_list)
-        instance_logits = torch.sigmoid(instance_logits)
-
-        instance_logits_list = []
-        im_inds = instance_list.get_image_indices()
-        for i in range(len(detections)):
-            inds = torch.where(im_inds == i)
-            instance_logits_list.append(instance_logits[inds])
-
-        detections_and_segmentations = []
-        for i in range(len(detections)):
-            cntrness, bboxes = get_instance_segmentation_centerness(
-                instance_logits_list[i] >= self.mask_threshold,
-                detections[i]["anchor_centers"],
-                True
-            )
-            centers = (bboxes[:, 3:] + bboxes[:, :3]) / 2
-            strides = bboxes[:, 3:] - bboxes[:, :3]
-            detections_and_segmentations.append(
-                detections[i] | {
-                    "centers": centers,
-                    "strides": strides,
-                    "cntrness": cntrness,
-                    "onehot_mask": instance_logits_list[i],
-                }
-            )
-
-        if n_patches > 0:
-            for i in range(len(detections_and_segmentations)):
-                scores = detections_and_segmentations[i]["scores"]
-                if len(scores) > 1:
-                    keep = batched_nms(
-                        detections_and_segmentations[i]["onehot_mask"] >= self.mask_threshold,
-                        scores,
-                        self.nms_thresh,
-                        metric="iom"
-                    )
-                    for key in list(detections_and_segmentations[i].keys()):
-                        detections_and_segmentations[i][key] = detections_and_segmentations[i][key][keep]
-
-            aggregated = []
-            for b in range(batch_size):
-                start, end = b * n_patches, (b + 1) * n_patches
-                det_and_seg_list = {key: [] for key in detections_and_segmentations[0].keys()}
-
-                offsets = inputs.meta["location"].transpose(1, 0)[start:end]
-                for det, offset in zip(detections_and_segmentations[start:end], offsets):
-                    for key, val in det.items():
-                        if key in ["anchor_centers", "centers"]:
-                            det_and_seg_list[key].append(val + torch.tensor(offset, device=val.device))
-                        else:
-                            det_and_seg_list[key].append(val)
-
-                det_and_seg = {
-                    key: torch.cat(val, dim=0)
-                    for key, val in det_and_seg_list.items()
-                    if key != "onehot_mask"
-                }
-                onehot_mask = patch_tensor_concat(
-                    like_shape=(len(det_and_seg["scores"]), 1, out_h, out_w, out_d),
-                    patches=det_and_seg_list["onehot_mask"],
+                inst = ImageInstancesData.from_keep(anchors=anchors_cat, keep_idxs=empty_keep)
+                per_image_instances.append(inst)
+                detections.append(
+                    {
+                        "anchor_centers": inst.anchor_centers[empty_keep],
+                        "anchor_strides": inst.anchor_strides[empty_keep],
+                        "classes": empty_classes,
+                        "scores": empty_scores,
+                        "keep_idxs": empty_keep,
+                    }
                 )
-                aggregated.append(det_and_seg | {"onehot_mask": onehot_mask})
+                continue
 
-            detections_and_segmentations = [batched_lbe(d, self.batched_lbe_method) for d in aggregated]
+            # concat across levels for this image
+            keep_idxs = torch.cat(img_keep_idxs_all, dim=0)  # [K_total]
+            scores = torch.cat(img_scores_all, dim=0)  # [K_total]
+            classes = torch.cat(img_classes_all, dim=0)  # [K_total]
 
-            patch_semantic_logits = outputs["semantic_logits"]
-            semantic_logits = patch_tensor_concat(
-                like_shape=(batch_size, int(self.cfg.model.semantic_num_classes), out_h, out_w, out_d),
-                patches=patch_semantic_logits.view(batch_size, n_patches, int(self.cfg.model.semantic_num_classes),
-                                                   *patch_semantic_logits.shape[-3:])
+            # build per-image instance data (stores centers/strides for all anchors + keep indices)
+            inst = ImageInstancesData.from_keep(anchors=anchors_cat, keep_idxs=keep_idxs)
+            per_image_instances.append(inst)
+
+            # centers/strides for selected candidates (K_total,3)
+            det_centers = inst.anchor_centers[keep_idxs]
+            det_strides = inst.anchor_strides[keep_idxs]
+
+            detections.append(
+                {
+                    "anchor_centers": det_centers,
+                    "anchor_strides": det_strides,
+                    "classes": classes,
+                    "scores": scores,
+                    "keep_idxs": keep_idxs,
+                }
             )
+
+        return detections, per_image_instances
+
+    @torch.no_grad()
+    def compute_detections_and_segmentations(self, inputs: Tensor) -> List[Dict[str, Tensor]]:
+        """
+            Returns a list length = batch_size (if patchified -> aggregated per original image),
+            else length = N.
+            Each element is a dict with keys:
+              - "anchor_centers": [K,3]
+              - "anchor_strides": [K,3]
+              - "classes":        [K]
+              - "scores":         [K]
+              - "onehot_logits":  [K,1,H,W,D]  (sigmoid output)
+              - "bboxes":         [K,6]        (computed from thresholded mask)
+        """
+        output_shape = inputs.meta["dim"][1:4]  # (out_h,out_w,out_d)
+        out_h, out_w, out_d = map(int, output_shape)
+        h, w, d = inputs.shape[-3:]
+
+        n_patches = 0
+        batch_size = 1
+
+        patchified = (h < out_h) or (w < out_w) or (d < out_d)
+        if patchified:
+            if inputs.ndim == 6:  # [B,P,C,H,W,D]
+                batch_size, n_patches = inputs.shape[:2]
+                flat_inputs = inputs.reshape(batch_size * n_patches, *inputs.shape[-4:])
+            else:  # [P,C,H,W,D]
+                n_patches = inputs.shape[0]
+                batch_size = 1
+                flat_inputs = inputs.reshape(n_patches, *inputs.shape[-4:])
         else:
-            semantic_logits = outputs["semantic_logits"]
-            batch_size = semantic_logits.shape[0]
+            flat_inputs = inputs
+            batch_size = inputs.shape[0]
 
-        semantic_mask = torch.argmax(torch.softmax(semantic_logits, dim=1), dim=1, keepdim=True)
-        semantic_mask = semantic_mask.to(dtype=torch.float) / float(self.cfg.model.semantic_divisor)
+        device = flat_inputs.device
 
-        for i, per_img in enumerate(detections_and_segmentations):
-            per_img.update({"semantic_mask": semantic_mask[i]})
-        return detections_and_segmentations
+        outputs = self.forward(flat_inputs)
 
-    def postprocess(self, detection_and_segmentation):
-        filter_keys = ["anchor_centers", "anchor_strides", "classes", "scores", "centers", "strides", "cntrness"]
+        detections, per_image_instances = self._compute_detections(outputs)
 
-        for i, per_img in enumerate(detection_and_segmentation):
+        inst_list = InstanceList(per_image_instances, max_samples=-1)
+        inst_logits = self.instance_segmentation_head(
+            outputs["f_mask"],
+            outputs["controller_logits"],
+            inst_list,
+        )
+
+        stride = getattr(self.instance_segmentation_head, "stride", 1)
+        # upsample if needed (supports int or tuple stride)
+        needs_upsample = (stride > 1) if isinstance(stride, int) else any(s > 1 for s in stride)
+        if needs_upsample:
+            inst_logits = aligned_trilinear(inst_logits, stride)
+
+        inst_probs = torch.sigmoid(inst_logits)  # [M,1,W,H,D]
+
+        img_idx = inst_list.get_image_indices()  # [M]
+        per_patch_logits: List[Tensor] = []
+        for i in range(len(detections)):
+            sel = (img_idx == i)
+            per_patch_logits.append(inst_probs[sel])
+
+        mask_thresh = float(self.inference_hyperparams["mask_thresh"])
+        nms_thresh = float(self.inference_hyperparams["nms_thresh"])
+
+        detseg_per_patch: List[Dict[str, Tensor]] = []
+        for i, det in enumerate(detections):
+            probs_i = per_patch_logits[i]  # [K,1,W,H,D]
+            bboxes = get_onehot_instance_mask_boxes(probs_i >= mask_thresh)  # [K,6]
+
+            out = {
+                "anchor_centers": det["anchor_centers"],
+                "anchor_strides": det["anchor_strides"],
+                "classes": det["classes"],
+                "scores": det["scores"],
+                "onehot_logits": probs_i,
+                "bboxes": bboxes,
+            }
+
+            if out["scores"].numel() > 1:
+                keep = batched_nms(out["bboxes"], out["scores"], nms_thresh, metric="iom")
+                if not torch.is_tensor(keep):
+                    keep = torch.as_tensor(keep, device=device, dtype=torch.long)
+                for k in ("anchor_centers", "anchor_strides", "classes", "scores", "onehot_logits", "bboxes"):
+                    out[k] = out[k][keep]
+
+            detseg_per_patch.append(out)
+
+        if not patchified:
+            return detseg_per_patch
+
+        offsets = inputs.meta["location"]
+        if isinstance(offsets, (list, tuple, np.ndarray)):
+            offsets = torch.as_tensor(offsets, device=device)
+        if offsets.ndim == 2 and offsets.shape[0] == 3:
+            offsets = offsets.T  # [total_patches,3]
+        offsets = offsets.to(device=device)
+
+        aggregated: List[Dict[str, Tensor]] = []
+        total_patches = batch_size * n_patches
+        assert len(detseg_per_patch) == total_patches
+
+        patch_spatial_shapes = get_patch_spatial_shapes(inputs, 0, total_patches).to(device=device)
+
+        for b in range(batch_size):
+            start, end = b * n_patches, (b + 1) * n_patches
+            patch_outs = detseg_per_patch[start:end]
+            patch_offsets = offsets[start:end]
+            patch_shapes = patch_spatial_shapes[start:end]
+
+            centers_list, strides_list, classes_list, scores_list, bboxes_list, logits_list = [], [], [], [], [], []
+
+            for det, off in zip(patch_outs, patch_offsets):
+                off = off.to(dtype=torch.float32)
+
+                centers_list.append(det["anchor_centers"] + off[None, :])
+                strides_list.append(det["anchor_strides"])
+                classes_list.append(det["classes"])
+                scores_list.append(det["scores"])
+
+                bb = det["bboxes"].clone()
+                bb[:, :3] += off[None, :]
+                bb[:, 3:] += off[None, :]
+                bboxes_list.append(bb)
+
+                logits_list.append(det["onehot_logits"])
+
+            merged = {
+                "anchor_centers": torch.cat(centers_list, dim=0) if centers_list else torch.empty((0, 3),
+                                                                                                  device=device),
+                "anchor_strides": torch.cat(strides_list, dim=0) if strides_list else torch.empty((0, 3),
+                                                                                                  device=device),
+                "classes": torch.cat(classes_list, dim=0) if classes_list else torch.empty((0,), device=device,
+                                                                                           dtype=torch.long),
+                "scores": torch.cat(scores_list, dim=0) if scores_list else torch.empty((0,), device=device,
+                                                                                        dtype=torch.float32),
+                "bboxes": torch.cat(bboxes_list, dim=0) if bboxes_list else torch.empty((0, 6), device=device,
+                                                                                        dtype=torch.float32),
+            }
+
+            merged["onehot_logits"] = merge_patch_logits_per_instance(
+                patches=logits_list,
+                like_shape=(merged["scores"].numel(), 1, out_h, out_w, out_d),
+                patch_offsets=patch_offsets,
+                patch_spatial_shapes=patch_shapes,
+                device=device,
+            )
+
+            merged = batched_lbe(merged)
+            aggregated.append(merged)
+
+        return aggregated
+
+    @torch.no_grad()
+    def postprocess(self, detections_and_segmentations: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
+        mask_thresh = float(self.inference_hyperparams.get("mask_thresh", 0.5))
+        nms_thresh = float(self.inference_hyperparams.get("nms_thresh", 0.1))
+
+        out = []
+        for per_img in detections_and_segmentations:
+            logits = per_img["onehot_logits"]  # [K,1,H,W,D] (logits or probs)
+            scores = per_img["scores"]  # [K]
+            K = int(logits.shape[0])
+
+            if K == 0:
+                # ensure expected keys exist
+                per_img["bboxes"] = logits.new_zeros((0, 6), dtype=torch.float32)
+                per_img["instance_mask"] = logits.new_zeros(logits.shape[-3:], dtype=torch.long)
+                out.append(per_img)
+                continue
+
+            # 1) binarize + postproc
+            onehot = (logits >= mask_thresh)
+            onehot = self.postproc_transform(onehot)
+
+            # 2) remove empty instances
+            keep = torch.any(onehot, dim=(1, 2, 3, 4))  # [K]
+            keep_idx = torch.where(keep)[0]
+
+            if keep_idx.numel() == 0:
+                H, W, D = onehot.shape[-3:]
+                empty = keep_idx  # [0]
+                per_img = {k: v[empty] for k, v in per_img.items()}
+                per_img["onehot_mask"] = onehot[empty]
+                per_img["bboxes"] = onehot.new_zeros((0, 6), dtype=torch.float32)
+                per_img["instance_mask"] = onehot.new_zeros((H, W, D), dtype=torch.long)
+                out.append(per_img)
+                continue
+
+            per_img = {k: v[keep_idx] for k, v in per_img.items()}
+            onehot = onehot[keep_idx]
             scores = per_img["scores"]
-            onehot_logits = per_img["onehot_mask"]
-            onehot_mask = (onehot_logits >= self.inference_hyperparams["mask_threshold"]).to(dtype=torch.bool, copy=False)
-            semantic_mask = per_img["semantic_mask"]
 
-            if len(scores) > 0:
-                onehot_mask = self.postproc_transform(onehot_mask)
-                pp_keep = torch.any(onehot_mask, dim=(1, 2, 3, 4))
-                onehot_mask = onehot_mask[pp_keep]
-                scores = scores[pp_keep]
-                per_img = filter_dictionary_of_tensors(per_img, filter_keys, pp_keep)
+            # 3) boxes for NMS (IoU on boxes)
+            bboxes = get_onehot_instance_mask_boxes(onehot)  # must return [K',6]
+            per_img["bboxes"] = bboxes
 
-                if onehot_mask.shape[0] > 0:
-                    down_sampled_mask = F.max_pool3d(onehot_mask.float(), 2, 2) >= 0.5
-                    down_sampled_mask_filled = torch.stack([fill_convex_hull_4d(x) for x in down_sampled_mask], dim=0)
+            # 4) NMS
+            if onehot.shape[0] > 1:
+                keep_nms = batched_nms(bboxes, scores, threshold=nms_thresh, metric="iou")
+                keep_nms = torch.as_tensor(keep_nms, device=onehot.device, dtype=torch.long)
 
-                    down_sampled_semantic_mask = F.max_pool3d(semantic_mask, 2, 2)
-                    semantic_consensus = torch.any(
-                        down_sampled_mask_filled & (down_sampled_semantic_mask > float(self.cfg.model.semantic_consensus_threshold)),
-                        dim=(1, 2, 3, 4)
-                    )
-                    scores.add_(semantic_consensus.float() * self.semantic_consensus_score)
+                per_img = {k: v[keep_nms] for k, v in per_img.items()}
+                onehot = onehot[keep_nms]
+                scores = per_img["scores"]
 
-                    nms_keep = batched_nms(down_sampled_mask_filled, scores, threshold=self.nms_thresh, metric="iom")
-                    onehot_mask = onehot_mask[nms_keep]
-                    scores = scores[nms_keep]
-                    per_img = filter_dictionary_of_tensors(per_img, filter_keys, nms_keep)
-
-            if self.stride > 1:
-                onehot_mask = F.interpolate(onehot_mask.float(), scale_factor=self.stride, mode="trilinear") >= 0.5
-
-            instance_mask = priority_based_onehot_to_instance_mask(onehot_mask=onehot_mask, scores=scores)
-
+            # 5) mutually exclusive instance mask + onehot
+            instance_mask = priority_based_onehot_to_instance_mask(onehot, scores)
+            # 6) Extract unique instance labels
             remained_instances = list(get_unique_labels(instance_mask, is_onehot=False, discard=0))
-            remained_instances = [x - 1 for x in remained_instances]
-            per_img = filter_dictionary_of_tensors(per_img, filter_keys, remained_instances)
+            remained_instances = [x - 1 for x in remained_instances]  # undo the effect of background class
+            per_img = {k: v[remained_instances] for k, v in per_img.items()}
 
             instance_mask = relabel_sequential(instance_mask, exclude_background=True)
-            mutually_exclusive_onehot_mask = instance_mask_to_onehot(instance_mask)
+            mutually_exclusive_onehot = instance_mask_to_onehot(instance_mask)
 
-            per_img["onehot_mask"] = mutually_exclusive_onehot_mask
+            per_img["onehot_mask"] = mutually_exclusive_onehot
             per_img["instance_mask"] = instance_mask
 
-            detection_and_segmentation[i] = per_img
+            out.append(per_img)
 
-        return detection_and_segmentation
-
-    def get_out_shape(self, batch):
-        return torch.size(1, 1, 192, 192, 192)
+        return out
 
     # ---------------- Forward ----------------
     def forward(self, inputs) -> Any:
@@ -579,128 +727,221 @@ class CondInst3dPRL(pl.LightningModule):
         return loss
 
     def on_validation_start(self) -> None:
-        if len(self.images_to_visualize) == 0:
-            self.assign_images_to_visualize()
+        # Choose once per fit unless user changed params.
+        if not getattr(self, "images_to_visualize", None):
+            self._assign_images_to_visualize()
 
-    def validation_step(self, batch, batch_idx) -> STEP_OUTPUT:
-        targets = batch["targets"]
-        detections_and_segmentations = self.predict_step(batch, batch_idx)
+    def validation_step(self, batch: dict, batch_idx: int) -> Any:
+        targets = batch["targets"]  # list[dict]
+        preds = self.predict_step(batch, batch_idx)
 
-        image_to_show = None
-        for image_index, det_per_image in enumerate(detections_and_segmentations):
-            pred_onehot_mask = det_per_image["onehot_mask"]
-            scores = det_per_image["scores"]
-            semantic_mask = det_per_image["semantic_mask"]
-            gt_masks = targets[image_index]["onehot"]
+        metric_dict = self.metrics["validation"]
 
-            pairwise_mask_iou = mask_intersection_over_union(pred_onehot_mask.squeeze(1), gt_masks)
-            self.metrics["validation"][str(dataloader_idx)]["mask_cfm"].update(pairwise_mask_iou)
-            self.metrics["validation"][str(dataloader_idx)]["mask_ap"].update(pairwise_mask_iou, scores)
+        # ---------------- metrics (fast) ----------------
+        for i, det in enumerate(preds):
+            # ---------- masks ----------
+            pred_onehot = det["onehot_mask"]  # [K,1,H,W,D] bool (postprocessed)
+            scores = det["scores"]  # [K]
+            gt_onehot = targets[i]["onehot"]  # [G,1,H,W,D] or [G,H,W,D]
 
-            if self.trainer.is_global_zero and batch_idx in self.images_to_visualize.get(dataloader_idx, []):
-                target_instance_mask = onehot_to_instance_mask(gt_masks)
-                prediction_instance_mask = det_per_image["instance_mask"]
-                stats = get_stats(pairwise_mask_iou, scores=scores)
+            if gt_onehot.ndim == 5 and gt_onehot.shape[1] == 1:
+                gt_onehot_eval = gt_onehot.squeeze(1)  # [G,H,W,D]
+            else:
+                gt_onehot_eval = gt_onehot
 
-                _, eccentricity = onehot_instance_mask_get_axial_eccentricity(det_per_image["onehot_mask"].unsqueeze(1))
-                for ecc, st in zip(eccentricity, stats["y_pred"].values()):
-                    st.update({"min-eccentricity": min(ecc)})
+            if pred_onehot.ndim == 5 and pred_onehot.shape[1] == 1:
+                pred_onehot_eval = pred_onehot.squeeze(1)  # [K,H,W,D]
+            else:
+                pred_onehot_eval = pred_onehot
 
-                if image_to_show is None:
-                    current_input = batch["current_image"]
-                    out_h, out_w, out_d = self.get_out_shape(batch)
-                    h, w, d = current_input.shape[-3:]
-                    if h < out_h or w < out_w or d < out_d:
-                        if current_input.ndim == 6:
-                            batch_size, n_patches, ch = current_input.shape[:3]
-                        else:
-                            batch_size = 1
-                            n_patches, ch = current_input.shape[:2]
-                        current_input = patch_tensor_concat(
-                            like_shape=(batch_size, ch, out_h, out_w, out_d),
-                            patches=current_input
-                        )
-                    image_to_show = torch.cat([
-                        current_input,
-                        batch["ct2f_stx"],
-                        semantic_mask.unsqueeze(1),
-                        batch.get("cprl_previous", torch.zeros_like(batch["ct2f_stx"])),
-                    ], dim=1)
+            pairwise_mask_iou = mask_intersection_over_union(pred_onehot_eval, gt_onehot_eval)
+            metric_dict["mask_cfm"].update(pairwise_mask_iou)
+            metric_dict["mask_ap"].update(pairwise_mask_iou, scores)
 
-                title = "{}/{}/{}/{}".format(
-                    batch["trial"][image_index],
-                    batch["site"][image_index],
-                    batch["subject"][image_index],
-                    batch["timepoint"][image_index]
-                )
+            # ---------- boxes ----------
+            gt_boxes = targets[i]["boxes"]
+            if gt_boxes.ndim == 1:
+                gt_boxes = gt_boxes.unsqueeze(0)
+            assert gt_boxes.ndim == 2 and gt_boxes.shape[1] == 6, f"gt_boxes must be [G,6], got {gt_boxes.shape}"
 
-                figs = self.instance_head_visualizer.plot(
-                    inputs=image_to_show[image_index],
-                    y_pred=prediction_instance_mask,
-                    y_true=target_instance_mask,
-                    stats=[stats],
-                    title=title,
-                    add_info_text=True,
-                    boxes_true=None,
-                    boxes_pred=None,
-                    boxes_scores=None
-                )
-                for t, fig in figs.items():
-                    fig_name = "Images- {}- {}/{} from {} - {}".format(
-                        group,
-                        title.replace("/", "-"),
-                        batch["n_conf_lesions"][image_index] if "n_conf_lesions" in batch else "?",
-                        batch["n_lesions"][image_index] if "n_lesions" in batch else "?",
-                        t,
-                    )
-                    self.log_figure(fig_name, fig)
+            pred_boxes = det["bboxes"]
+            if pred_boxes.ndim == 1:
+                pred_boxes = pred_boxes.unsqueeze(0)
+            assert pred_boxes.ndim == 2 and pred_boxes.shape[
+                1] == 6, f"pred_boxes must be [K,6], got {pred_boxes.shape}"
+
+            pairwise_box_iou = box_intersection_over_union(pred_boxes, gt_boxes)  # [K,G]
+            metric_dict["box_cfm"].update(pairwise_box_iou)
+            metric_dict["box_ap"].update(pairwise_box_iou, scores)
+
+        # ---------------- visualization (only on selected batches) ----------------
+        if not (self.trainer.is_global_zero and batch_idx in set(self.images_to_visualize.get(0, []))):
+            return preds
+
+        # Full original input (no patch stitching)
+        inputs_full = batch["inputs_orig"]  # [B,C,H,W,D] (preferably)
+        cases = batch.get("case", None)
+
+        for i, det in enumerate(preds):
+            gt_onehot = targets[i]["onehot"]
+            if gt_onehot.ndim == 5 and gt_onehot.shape[1] == 1:
+                gt_onehot_eval = gt_onehot.squeeze(1)
+            else:
+                gt_onehot_eval = gt_onehot
+
+            pred_onehot = det["onehot_mask"]
+            pred_onehot_eval = pred_onehot.squeeze(1) if (
+                        pred_onehot.ndim == 5 and pred_onehot.shape[1] == 1) else pred_onehot
+
+            pairwise_mask_iou = mask_intersection_over_union(pred_onehot_eval, gt_onehot_eval)
+            stats = get_stats(pairwise_mask_iou, scores=det["scores"])
+
+            title = str(cases[i]) if cases is not None else f"idx={i}"
+
+            figs = self.instance_head_visualizer.plot(
+                inputs=inputs_full[i],
+                y_pred=det["instance_mask"],
+                y_true=onehot_to_instance_mask(gt_onehot_eval),
+                stats=[stats],
+                title=title,
+                add_info_text=True,
+                boxes_true=targets[i].get("boxes", None),
+                boxes_pred=det.get("bboxes", None),
+                boxes_scores=det.get("scores", None),
+            )
+
+            for t, fig in figs.items():
+                fig_name = f"Images-{title}/{t}"
+                self._log_figure(fig_name, fig)
+                try:
+                    import matplotlib.pyplot as plt
                     plt.close(fig)
+                except Exception:
+                    pass
 
-        return detections_and_segmentations
+        return preds
+
+    # ---------------- Figure logging ----------------
+    def _log_figure(self, name: str, fig, *, close: bool = True) -> None:
+        """
+        Logs a matplotlib figure to the active experiment logger (e.g. TensorBoard).
+        Only rank0 should create/submit figures to avoid duplicates.
+        """
+        if not getattr(self.trainer, "is_global_zero", True):
+            return
+        if self.logger is None:
+            return
+        exp = getattr(self.logger, "experiment", None)
+        if exp is None:
+            return
+
+        # tensorboard SummaryWriter has add_figure
+        add_figure = getattr(exp, "add_figure", None)
+        if add_figure is None:
+            return
+
+        add_figure(name, fig, global_step=self.current_epoch)
+
+        if close:
+            try:
+                import matplotlib.pyplot as plt
+                plt.close(fig)
+            except Exception:
+                pass
+
+    # ---------------- scalar logging ----------------
+    def _log_scalar(self, name: str, value: Tensor | float, *, sync_dist: bool = True) -> None:
+        """
+        Single place to control defaults.
+        IMPORTANT: logger=True forced here.
+        """
+        self.log(
+            name,
+            _to_float(value),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,  # <-- forced TRUE
+            batch_size=1,
+            sync_dist=sync_dist,
+        )
+
+    @torch.no_grad()
+    def _log_cfm_series(
+            self,
+            prefix: str,
+            cfm: Tensor,  # [T, 3] -> TP,FP,FN
+            iou_thresholds: Iterable[float],
+            ap_per_thr: Optional[Tensor] = None,  # [T] optional
+    ) -> None:
+        precision = compute_precision(cfm)
+        recall = compute_recall(cfm)
+        f1 = compute_fi(cfm, i=1)
+        f2 = compute_fi(cfm, i=2)
+
+        for i, th in enumerate(iou_thresholds):
+            th_str = f"{float(th):.2f}"
+
+            tp, fp, fn = cfm[i][0], cfm[i][1], cfm[i][2]
+            self._log_scalar(f"{prefix}/TP@{th_str}", tp)
+            self._log_scalar(f"{prefix}/FP@{th_str}", fp)
+            self._log_scalar(f"{prefix}/FN@{th_str}", fn)
+
+            self._log_scalar(f"{prefix}/Precision@{th_str}", precision[i])
+            self._log_scalar(f"{prefix}/Recall@{th_str}", recall[i])
+            self._log_scalar(f"{prefix}/F1@{th_str}", f1[i])
+            self._log_scalar(f"{prefix}/F2@{th_str}", f2[i])
+
+            if ap_per_thr is not None:
+                # if ap_per_thr isn't 1D, best-effort take scalar per threshold
+                ap_i = ap_per_thr[i]
+                ap_i = ap_i.mean() if isinstance(ap_i, Tensor) and ap_i.numel() > 1 else ap_i
+                self._log_scalar(f"{prefix}/AP@{th_str}", ap_i)
 
     def on_validation_epoch_end(self) -> None:
-        val_loaders = self.trainer.val_dataloaders
-        if isinstance(val_loaders, DataLoader):
-            val_loaders = [val_loaders]
+        """
+        Single validation dataloader: log BOTH mask and box metrics.
+        Assumes self.metrics["validation"]["0"] contains:
+          - mask_cfm, mask_ap
+          - box_cfm, box_ap
+        with .compute(), .plot() and .reset().
+        """
+        metric_dict = self.metrics["validation"]
 
-        for dataloader_idx, _ in enumerate(val_loaders):
-            didx = str(dataloader_idx)
-            group = "cross_sectional" if didx == "0" else "longitudinal"
-            metric_dict = self.metrics["validation"][didx]
+        # ---------------- Masks ----------------
+        mask_cfm: Tensor = metric_dict["mask_cfm"].compute()     # [T,3]
+        mask_ap: Tensor = metric_dict["mask_ap"].compute()       # [T] or [T,...]
+        mask_fig, _ = metric_dict["mask_ap"].plot()
 
-            per_iou_cfm = metric_dict["mask_cfm"].compute()
-            per_iou_ap = metric_dict["mask_ap"].compute()
-            pr_fig, _ = metric_dict["mask_ap"].plot()
+        self._log_figure("Validation/Masks/PR-curve", mask_fig, close=True)
+        self._log_scalar("Validation/Masks/mAP", _safe_mean(mask_ap))
 
-            precision = compute_precision(per_iou_cfm)
-            recall = compute_recall(per_iou_cfm)
-            f1 = compute_fi(per_iou_cfm, i=1)
-            f2 = compute_fi(per_iou_cfm, i=2)
+        mask_thresholds = metric_dict["mask_cfm"].iou_thresholds
+        self._log_cfm_series(
+            prefix="Validation/Masks-IoU",
+            cfm=mask_cfm,
+            iou_thresholds=mask_thresholds,
+            ap_per_thr=mask_ap if mask_ap.numel() else None,
+        )
 
-            self.log_figure(f"Validation-Masks/{group}/Precision-Recall curve", pr_fig)
-            self.log(f"Validation-Masks/{group}/Mean AP", torch.mean(per_iou_ap),
-                     on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        # ---------------- Boxes ----------------
+        box_cfm: Tensor = metric_dict["box_cfm"].compute()       # [T,3]
+        box_ap: Tensor = metric_dict["box_ap"].compute()         # [T] or [T,...]
+        box_fig, _ = metric_dict["box_ap"].plot()
 
-            for i, th in enumerate(metric_dict["mask_cfm"].iou_thresholds):
-                self.log(f"Validation-Masks-IoU/{group}/TP at iou={th:.2f}", per_iou_cfm[i][0],
-                         on_step=False, on_epoch=True, sync_dist=True)
-                self.log(f"Validation-Masks-IoU/{group}/FP at iou={th:.2f}", per_iou_cfm[i][1],
-                         on_step=False, on_epoch=True, sync_dist=True)
-                self.log(f"Validation-Masks-IoU/{group}/FN at iou={th:.2f}", per_iou_cfm[i][2],
-                         on_step=False, on_epoch=True, sync_dist=True)
+        self._log_figure("Validation/Boxes/PR-curve", box_fig, close=True)
+        self._log_scalar("Validation/Boxes/mAP", _safe_mean(box_ap))
 
-                self.log(f"Validation-Masks-IoU/{group}/Precision at iou={th:.2f}", precision[i],
-                         on_step=False, on_epoch=True, sync_dist=True)
-                self.log(f"Validation-Masks-IoU/{group}/Recall at iou={th:.2f}", recall[i],
-                         on_step=False, on_epoch=True, sync_dist=True)
-                self.log(f"Validation-Masks-IoU/{group}/F1-score at iou={th:.2f}", f1[i],
-                         on_step=False, on_epoch=True, sync_dist=True)
-                self.log(f"Validation-Masks-IoU/{group}/F2-score at iou={th:.2f}", f2[i],
-                         on_step=False, on_epoch=True, sync_dist=True)
-                self.log(f"Validation-Masks-IoU/{group}/Average-Precision at iou={th:.2f}", per_iou_ap[i],
-                         on_step=False, on_epoch=True, sync_dist=True)
+        box_thresholds = metric_dict["box_cfm"].iou_thresholds
+        self._log_cfm_series(
+            prefix="Validation/Boxes-IoU",
+            cfm=box_cfm,
+            iou_thresholds=box_thresholds,
+            ap_per_thr=box_ap if box_ap.numel() else None,
+        )
 
-            metric_dict.reset()
+        # ---------------- reset once ----------------
+        metric_dict.reset()
 
     def predict_step(self, batch: dict, batch_idx, dataloader_idx=0) -> Any:
         inputs = batch["inputs"]
@@ -708,45 +949,64 @@ class CondInst3dPRL(pl.LightningModule):
         det = self.postprocess(det)
         return det
 
-        # ---------------- Optimizers ----------------
-        def configure_optimizers(self) -> OptimizerLRScheduler:
-            """
-            Fully configurable with Hydra:
-              cfg.optim.pretrain / cfg.optim.finetune / cfg.optim.slicewise
-            """
-            stage = str(self.train_stage)
-            optim_cfg = self.cfg.optim.get(stage, None)
-            if optim_cfg is None:
-                raise ValueError(f"Missing cfg.optim.{stage} in config")
+    # ---------------- Optimizers ----------------
+    def configure_optimizers(self) -> OptimizerLRScheduler:
+        """
+            Expects cfg to contain:
+              cfg.optim.optimizer: Hydra config that instantiates torch.optim.Optimizer
+              cfg.optim.scheduler: (optional) Hydra config that instantiates a LR scheduler
+              cfg.optim.scheduler_cfg: (optional) Lightning scheduler wrapper params
 
-            # Optional: stage can freeze/unfreeze in cfg too
-            if stage == "slicewise" and bool(self.cfg.optim.slicewise.freeze_all_then_unfreeze):
-                for p in self.parameters():
-                    p.requires_grad = False
+            Returns:
+              - optimizer
+              - OR dict with optimizer + lr_scheduler
+        """
+        if not hasattr(self, "cfg"):
+            raise AttributeError("Expected self.cfg to exist (store your Hydra cfg on the module).")
 
-                # unfreeze list of modules by config attribute names
-                for name in list(self.cfg.optim.slicewise.unfreeze_modules):
-                    module = self._resolve_attr(name)
-                    for p in module.parameters():
-                        p.requires_grad = True
+        opt_cfg = self.cfg.optim  # <-- Fix 2 expects scheduler here, not under optimizer
 
-                params = filter(lambda p: p.requires_grad, self.parameters())
-            else:
-                params = self.parameters()
+        if "optimizer" not in opt_cfg or opt_cfg.optimizer is None:
+            raise ValueError("cfg.optim.optimizer must be provided.")
 
-            optim = instantiate(optim_cfg.optimizer, params=params)
+        # --- Optimizer ---
+        optimizer = instantiate(opt_cfg.optimizer, params=self.parameters())
 
-            if "scheduler" in optim_cfg and optim_cfg.scheduler is not None:
-                sched = instantiate(optim_cfg.scheduler, optimizer=optim)
-                sched_dict = {"scheduler": sched, "interval": str(optim_cfg.get("interval", "epoch"))}
-                return [optim], [sched_dict]
-            return optim
+        # --- Scheduler config location (Fix 2) ---
+        scheduler_cfg_node = opt_cfg.get("scheduler", None)
 
-        def _resolve_attr(self, dotted: str):
-            """
-            Resolve dotted attribute like 'backbone.encoder.specific_modality_inp'
-            """
-            obj = self
-            for part in dotted.split("."):
-                obj = getattr(obj, part)
-            return obj
+        # Backward-compatible fallback (in case an old config still nests it)
+        if scheduler_cfg_node is None and opt_cfg.optimizer is not None:
+            scheduler_cfg_node = opt_cfg.optimizer.get("scheduler", None)
+
+        # No scheduler
+        if scheduler_cfg_node is None:
+            return optimizer
+
+        # --- Scheduler ---
+        scheduler = instantiate(scheduler_cfg_node, optimizer=optimizer)
+
+        # Default Lightning wrapper
+        sched_wrap: Dict[str, Any] = {
+            "scheduler": scheduler,
+            "interval": "epoch",
+            "frequency": 1,
+        }
+
+        # Optional wrapper settings (Fix 2: cfg.optim.scheduler_cfg)
+        user_cfg = opt_cfg.get("scheduler_cfg", None)
+        if user_cfg is not None:
+            user_wrap = OmegaConf.to_container(user_cfg, resolve=True)
+            if not isinstance(user_wrap, dict):
+                raise ValueError("cfg.optim.scheduler_cfg must be a mapping/dict.")
+            sched_wrap.update(user_wrap)
+
+        # ReduceLROnPlateau requires monitor
+        if scheduler.__class__.__name__ == "ReduceLROnPlateau":
+            if "monitor" not in sched_wrap:
+                raise ValueError(
+                    "ReduceLROnPlateau requires cfg.optim.scheduler_cfg.monitor, e.g. "
+                    "monitor: 'Validation/Masks/mAP'"
+                )
+
+        return {"optimizer": optimizer, "lr_scheduler": sched_wrap}

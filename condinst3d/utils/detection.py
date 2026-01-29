@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 import torch
 from torch import Tensor
+from monai.transforms.utils import generate_spatial_bounding_box
 
 
 @dataclass
@@ -185,3 +186,163 @@ class InstanceList:
             out[sel] = gathered
 
         return out
+
+def get_onehot_instance_mask_boxes(instance_segmentation: Tensor) -> Tensor:
+    """
+    instance_segmentation: [N,1,H,W,D] bool or uint8
+    returns: [N,6] float32 (x1,y1,z1,x2,y2,z2)
+    """
+    n = instance_segmentation.shape[0]
+    if n == 0:
+        return instance_segmentation.new_zeros((0, 6), dtype=torch.float32)
+
+    boxes = []
+    for m in instance_segmentation:
+        if not torch.any(m):
+            # empty -> zeros
+            boxes.append(m.new_zeros((6,), dtype=torch.float32))
+            continue
+        start, end = generate_spatial_bounding_box(m, allow_smaller=True)
+        boxes.append(torch.tensor(start + end, device=m.device, dtype=torch.float32))
+
+    return torch.stack(boxes, dim=0)
+
+
+def priority_based_onehot_to_instance_mask(onehot_mask: Tensor, scores: Tensor) -> Tensor:
+    """
+    onehot_mask:
+      - [N, 1, H, W, D] or [N, H, W, D]   (typical)
+      - or [N, C, H, W, D]               (multi-class)
+    scores: [N]
+
+    Returns:
+      instance_mask: [C, H, W, D] where labels are 1..N (global instance ids by score rank),
+      or [1, H, W, D] if C=1. Background = 0.
+    """
+    if onehot_mask.ndim == 4:
+        onehot_mask = onehot_mask.unsqueeze(1)  # [N,1,H,W,D]
+    if onehot_mask.ndim != 5:
+        raise ValueError(f"onehot_mask must be 4D or 5D, got {onehot_mask.shape}")
+
+    N, C, H, W, D = onehot_mask.shape
+    if scores.ndim != 1:
+        scores = scores.view(-1)
+    if scores.numel() != N:
+        raise ValueError(f"N(onehot) != len(scores): {N} != {scores.numel()}")
+
+    if N == 0:
+        return onehot_mask.new_zeros((C, H, W, D), dtype=torch.int16)
+
+    # Ensure boolean for correct masking; allow float/bool inputs
+    m = onehot_mask > 0  # [N,C,H,W,D] bool
+
+    # Put scores on same device/dtype as we need for broadcast
+    s = scores.to(device=m.device, dtype=torch.float32).view(N, 1, 1, 1, 1)
+
+    # Score-weighted masks; background is 0 score
+    weighted = m.to(torch.float32) * s  # [N,C,H,W,D]
+
+    # Best instance per voxel
+    best_score, best_idx = weighted.max(dim=0)  # each: [C,H,W,D], idx in [0..N-1]
+    # Convert to instance labels (idx+1) only where any instance present
+    inst = (best_idx + 1).to(torch.int16)
+    inst = torch.where(best_score > 0, inst, inst.new_zeros(()).expand_as(inst))
+
+    return inst
+
+
+def instance_mask_to_onehot(mask: Tensor, return_instance_ids: bool = False):
+    """
+    mask: [H,W,D] or [1,H,W,D] or [1,1,H,W,D]
+    Returns:
+      onehot: [N, H, W, D] (dtype = uint8 by default)
+    """
+    # squeeze optional batch/channel
+    if mask.ndim == 5:
+        if mask.shape[0] != 1:
+            raise ValueError("Only batch size 1 supported.")
+        mask = mask[0]
+    if mask.ndim == 4:
+        if mask.shape[0] != 1:
+            raise ValueError("Only channel size 1 supported.")
+        mask = mask[0]
+    if mask.ndim != 3:
+        raise ValueError(f"mask must end up 3D [H,W,D], got {mask.shape}")
+
+    ids = torch.unique(mask)
+    ids = ids[ids != 0]  # remove background
+
+    if ids.numel() == 0:
+        onehot = mask.new_zeros((0, *mask.shape), dtype=torch.uint8)
+        return (onehot, ids.to(torch.long)) if return_instance_ids else onehot
+
+    # [N,1,1,1] == [1,H,W,D] -> [N,H,W,D]
+    onehot = (mask.unsqueeze(0) == ids.view(-1, 1, 1, 1)).to(torch.uint8)
+
+    return (onehot, ids.to(torch.long)) if return_instance_ids else onehot
+
+
+def onehot_to_instance_mask(onehot_mask: Tensor, inds: Optional[Tensor] = None) -> Tensor:
+    """
+    Convert instance onehot -> instance id mask per class.
+
+    Args:
+        onehot_mask:
+            [N, C, W, H, D] or [N, W, H, D]
+            N = num instances, C = num classes (often 1)
+            values are {0,1} (bool/uint8/int/float ok).
+        inds:
+            optional mapping for instance ids.
+            - If provided, should be shape [N] (or list/1D tensor).
+            - Output ids (1..N) will be replaced by inds values.
+              Background stays 0.
+
+    Returns:
+        instance_mask: [C, W, H, D] (dtype long)
+            0 = background
+            1..N = instance index (or mapped ids if inds provided)
+    """
+    if onehot_mask.ndim == 4:
+        onehot_mask = onehot_mask.unsqueeze(1)  # [N,1,W,H,D]
+    if onehot_mask.ndim != 5:
+        raise ValueError(f"Expected [N,C,W,H,D] or [N,W,H,D], got {onehot_mask.shape}")
+
+    N, C, W, H, D = onehot_mask.shape
+    device = onehot_mask.device
+
+    if N == 0:
+        # keep consistent dtype/shape with rest of pipeline
+        return torch.zeros((C, W, H, D), device=device, dtype=torch.long)
+
+    # Ensure boolean for cheap reductions
+    m = onehot_mask.to(dtype=torch.bool, copy=False)  # [N,C,W,H,D]
+
+    # any_instance[c] tells whether voxel belongs to any instance for that class
+    any_instance = m.any(dim=0)  # [C,W,H,D] bool
+
+    # argmax over instance dimension gives 0..N-1, but meaningless where any_instance==False
+    # Use int for indexing
+    arg = m.to(torch.uint8).argmax(dim=0).to(torch.long)  # [C,W,H,D], 0..N-1
+
+    # convert to 1..N where foreground, else 0
+    out = torch.where(any_instance, arg + 1, torch.zeros((), device=device, dtype=torch.long))
+
+    # Optional remap: ids 1..N -> inds values
+    if inds is not None:
+        if not torch.is_tensor(inds):
+            inds = torch.as_tensor(inds, device=device)
+        else:
+            inds = inds.to(device)
+
+        if inds.ndim != 1 or inds.numel() != N:
+            raise ValueError(f"`inds` must be shape [N]={N}, got {inds.shape}")
+
+        # Build lookup table: lut[0]=0 (bg), lut[i]=inds[i-1]
+        # dtype: match inds dtype if you want, but long is usually safest
+        lut = torch.empty((N + 1,), device=device, dtype=inds.dtype)
+        lut[0] = 0
+        lut[1:] = inds
+
+        out = lut[out]  # vectorized remap
+
+    return out
