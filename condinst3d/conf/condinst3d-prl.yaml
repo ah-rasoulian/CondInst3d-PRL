@@ -30,17 +30,17 @@ train:
 
   trainer:
     accelerator: gpu
-    devices: [0]
+    devices: [0, 1]
     precision: bf16-mixed
     max_epochs: 60
     gradient_clip_algorithm: norm
-    gradient_clip_val: 1.0
-    accumulate_grad_batches: 1
+    gradient_clip_val: 0.5
+    accumulate_grad_batches: 4
     num_sanity_val_steps: 0
-    check_val_every_n_epoch: 1
+    check_val_every_n_epoch: 5
     log_every_n_steps: 1
     limit_train_batches: 1.0
-    limit_val_batches: 1
+    limit_val_batches: 1.0
     enable_progress_bar: true
     # set true only if you want deterministic algos on torch side too
     deterministic: false
@@ -57,7 +57,7 @@ model:
     in_channels: 4
     filters: [ 64, 96, 128, 160, 192, 256 ]
     kernels: [ [ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ] ]
-    strides: [ [ 2,2,1 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2 ] ]
+    strides: [ [ 1,1,1 ],[ 2,2,1 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2 ] ]
     head_start_index: 2
     heads_dim: 160
     out_channels: 8
@@ -65,7 +65,7 @@ model:
   matcher:
     num_candidates: 8
     center_in_gt: False
-    anchors_sizes: [ [ 8,8,4 ], [ 16,16,8 ], [ 32,32,16 ] ]
+    anchors_sizes: [ [4,4,2], [ 8,8,4 ], [ 16,16,8 ] ]
 
   heads:
     classification:
@@ -82,21 +82,16 @@ model:
       num_layers: 3
 
   losses:
+    neg_pos_ratio: 3
     classification:
       _target_: condinst3d.losses.focal.FocalLoss
       alpha: 0.25
       gamma: 2.0
       reduction: none
     segmentation:
-      _target_: condinst3d.losses.dice_focal.DiceFocalLoss
-      lambda_dice: 1.0
-      lambda_focal: 1.0
-      # dice params
-      fg_weight: 1.0
-      # focal params
-      alpha: 0.5
-      gamma: 2.0
-      reduction: "mean"  # none|mean|sum
+      _target_: condinst3d.losses.dice.DiceLoss
+      reduction: "mean"     # none|mean|sum
+      from_logits: true     # set true if instance_logits are raw logits
 
   postproc:
     transforms: []
@@ -123,15 +118,15 @@ model:
   optim:
     optimizer:
       _target_: torch.optim.SGD
-      lr: 0.001
+      lr: 0.01
       momentum: 0.9
       weight_decay: 1e-4
       nesterov: true
 
     scheduler:
       _target_: torch.optim.lr_scheduler.MultiStepLR
-      milestones: [ 16, 30 ]
-      gamma: 0.2
+      milestones: [ 24, 36, 48 ]
+      gamma: 0.1
 
     scheduler_cfg:
       interval: epoch
@@ -155,7 +150,7 @@ data:
   empty_case_weight: 0.2
   instance_weight_power: 0.7
 
-  patch_size: [128, 128, 64]
-  patches_per_subject: 8
+  patch_size: [96, 96, 48]
+  patches_per_subject: 12
   patch_overlap: 0.25
   augmentation_prob: 0.2

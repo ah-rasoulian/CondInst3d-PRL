@@ -88,6 +88,7 @@ class CondInst3dPRL(pl.LightningModule):
             "classification": instantiate(cfg.losses.classification),
             "segmentation": instantiate(cfg.losses.segmentation),
         }
+        self.neg_pos_ratio = cfg.losses.neg_pos_ratio
 
         # -------------------- postproc params --------------------
         postproc_transforms = [Lambda(func=lambda x: x)]
@@ -238,12 +239,40 @@ class CondInst3dPRL(pl.LightningModule):
         gt_onehot = torch.zeros_like(cls_logits)
 
         if num_foreground > 0:
-            b_idx, a_idx = foreground_mask.nonzero(as_tuple=True)  # both [Nfg]
-            c_idx = all_gt_class_ids[b_idx, a_idx].long()  # [Nfg]
+            b_idx, a_idx = foreground_mask.nonzero(as_tuple=True)
+            c_idx = all_gt_class_ids[b_idx, a_idx].long()
             gt_onehot[b_idx, a_idx, c_idx] = 1.0
 
-        loss_cls = self.losses["classification"](cls_logits, gt_onehot)  # [B, A, C] if reduction="none"
-        loss_cls = loss_cls.sum() / max(1, num_foreground)
+        # loss per entry [B,A,C] because reduction="none"
+        loss_per_entry = self.losses["classification"](cls_logits, gt_onehot)
+
+        # reduce class dim -> per-anchor loss [B,A]
+        loss_per_anchor = loss_per_entry.sum(dim=-1)
+
+        # ---- hard negative sampling ----
+        neg_mask = ~foreground_mask  # [B,A]
+        neg_pos_ratio = getattr(self, "neg_pos_ratio", 3)
+        # number of negatives to keep
+        num_neg = int(min(int(neg_mask.sum().item()), neg_pos_ratio * max(1, num_foreground)))
+
+        if num_neg > 0:
+            # pick hardest negatives by loss
+            neg_losses = loss_per_anchor[neg_mask]  # [Nneg_total]
+            topk_vals, topk_idx = torch.topk(neg_losses, k=num_neg, largest=True, sorted=False)
+
+            # build a mask for selected negatives
+            selected = torch.zeros_like(neg_mask, dtype=torch.bool)
+            neg_indices = neg_mask.nonzero(as_tuple=False)  # [Nneg_total, 2]
+            selected_neg_indices = neg_indices[topk_idx]  # [num_neg, 2]
+            selected[selected_neg_indices[:, 0], selected_neg_indices[:, 1]] = True
+        else:
+            selected = torch.zeros_like(neg_mask, dtype=torch.bool)
+
+        # final mask = all positives + selected negatives
+        sample_mask = foreground_mask | selected
+
+        denom = int(sample_mask.sum().item())
+        loss_cls = loss_per_anchor[sample_mask].sum() / max(1, denom)
 
         return loss_cls, instance_data_list
 
@@ -277,8 +306,6 @@ class CondInst3dPRL(pl.LightningModule):
 
         gt_masks = instance_list.get_gt_mask(targets, dtype=instance_logits.dtype)
         loss = self.losses["segmentation"](instance_logits, gt_masks)
-        if loss.ndim > 0:
-            loss = loss.sum() / max(1, n_insts)
         return loss
 
     def compute_loss(self, outputs, targets):
@@ -443,7 +470,7 @@ class CondInst3dPRL(pl.LightningModule):
               - "anchor_strides": [K,3]
               - "classes":        [K]
               - "scores":         [K]
-              - "onehot_logits":  [K,1,H,W,D]  (sigmoid output)
+              - "onehot_probs":  [K,1,H,W,D]  (sigmoid output)
               - "bboxes":         [K,6]        (computed from thresholded mask)
         """
         output_shape = inputs.meta["dim"][1:4]  # (out_h,out_w,out_d)
@@ -488,17 +515,17 @@ class CondInst3dPRL(pl.LightningModule):
         inst_probs = torch.sigmoid(inst_logits)  # [M,1,W,H,D]
 
         img_idx = inst_list.get_image_indices()  # [M]
-        per_patch_logits: List[Tensor] = []
+        per_patch_probs: List[Tensor] = []
         for i in range(len(detections)):
             sel = (img_idx == i)
-            per_patch_logits.append(inst_probs[sel])
+            per_patch_probs.append(inst_probs[sel])
 
         mask_thresh = float(self.inference_hyperparams["mask_thresh"])
         nms_thresh = float(self.inference_hyperparams["nms_thresh"])
 
         detseg_per_patch: List[Dict[str, Tensor]] = []
         for i, det in enumerate(detections):
-            probs_i = per_patch_logits[i]  # [K,1,W,H,D]
+            probs_i = per_patch_probs[i]  # [K,1,W,H,D]
             bboxes = get_onehot_instance_mask_boxes(probs_i >= mask_thresh)  # [K,6]
 
             out = {
@@ -506,7 +533,7 @@ class CondInst3dPRL(pl.LightningModule):
                 "anchor_strides": det["anchor_strides"],
                 "classes": det["classes"],
                 "scores": det["scores"],
-                "onehot_logits": probs_i,
+                "onehot_probs": probs_i,
                 "bboxes": bboxes,
             }
 
@@ -514,7 +541,7 @@ class CondInst3dPRL(pl.LightningModule):
                 keep = batched_nms(out["bboxes"], out["scores"], nms_thresh, metric="iom")
                 if not torch.is_tensor(keep):
                     keep = torch.as_tensor(keep, device=device, dtype=torch.long)
-                for k in ("anchor_centers", "anchor_strides", "classes", "scores", "onehot_logits", "bboxes"):
+                for k in ("anchor_centers", "anchor_strides", "classes", "scores", "onehot_probs", "bboxes"):
                     out[k] = out[k][keep]
 
             detseg_per_patch.append(out)
@@ -556,7 +583,7 @@ class CondInst3dPRL(pl.LightningModule):
                 bb[:, 3:] += off[None, :]
                 bboxes_list.append(bb)
 
-                logits_list.append(det["onehot_logits"])
+                logits_list.append(det["onehot_probs"])
 
             merged = {
                 "anchor_centers": torch.cat(centers_list, dim=0) if centers_list else torch.empty((0, 3),
@@ -571,7 +598,7 @@ class CondInst3dPRL(pl.LightningModule):
                                                                                         dtype=torch.float32),
             }
 
-            merged["onehot_logits"] = merge_patch_logits_per_instance(
+            merged["onehot_probs"] = merge_patch_logits_per_instance(
                 patches=logits_list,
                 like_shape=(merged["scores"].numel(), 1, out_h, out_w, out_d),
                 patch_offsets=patch_offsets,
@@ -591,19 +618,21 @@ class CondInst3dPRL(pl.LightningModule):
 
         out = []
         for per_img in detections_and_segmentations:
-            logits = per_img["onehot_logits"]  # [K,1,H,W,D] (logits or probs)
+            onehot_probs = per_img["onehot_probs"]  # [K,1,H,W,D]
             scores = per_img["scores"]  # [K]
-            K = int(logits.shape[0])
+            K = int(onehot_probs.shape[0])
 
             if K == 0:
                 # ensure expected keys exist
-                per_img["bboxes"] = logits.new_zeros((0, 6), dtype=torch.float32)
-                per_img["instance_mask"] = logits.new_zeros(logits.shape[-3:], dtype=torch.long)
+                H, W, D = onehot_probs.shape[-3:]
+                per_img["bboxes"] = onehot_probs.new_zeros((0, 6), dtype=torch.float32)
+                per_img["onehot_mask"] = onehot_probs.new_zeros((0, 1, H, W, D), dtype=torch.bool)
+                per_img["instance_mask"] = onehot_probs.new_zeros((H, W, D), dtype=torch.long)
                 out.append(per_img)
                 continue
 
             # 1) binarize + postproc
-            onehot = (logits >= mask_thresh)
+            onehot = (onehot_probs >= mask_thresh)
             onehot = self.postproc_transform(onehot)
 
             # 2) remove empty instances
