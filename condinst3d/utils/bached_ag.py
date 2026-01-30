@@ -140,3 +140,42 @@ def batched_nms(
         order = rest[~suppress]
 
     return torch.stack(keep).to(dtype=torch.long)
+
+
+@torch.no_grad()
+def assign_to_kept_by_iou(
+    boxes: torch.Tensor,          # [K,6]
+    scores: torch.Tensor,         # [K]
+    kept_idx: torch.Tensor,       # [K_keep]
+    iou_thr: float = 0.3,
+) -> List[List[int]]:
+    """
+    Returns clusters as lists of indices into the original K items.
+    Each non-kept item is assigned to the kept box with max IoU if IoU>=thr; else it becomes its own cluster.
+    """
+    if kept_idx.numel() == 0:
+        return []
+
+    kept_boxes = boxes[kept_idx]
+    # pairwise IoU between all and kept
+    iou = box_intersection_over_union(boxes, kept_boxes)  # [K, K_keep]
+    max_iou, argmax = iou.max(dim=1)
+
+    # init clusters with kept elements
+    clusters = [[int(k)] for k in kept_idx.tolist()]
+    kept_pos = {int(k): j for j, k in enumerate(kept_idx.tolist())}
+
+    # assign others
+    for i in range(boxes.shape[0]):
+        if int(i) in kept_pos:
+            continue
+        if float(max_iou[i]) >= iou_thr:
+            j = int(argmax[i])
+            clusters[j].append(int(i))
+        else:
+            clusters.append([int(i)])
+
+    # optional: sort each cluster by score desc
+    for c in clusters:
+        c.sort(key=lambda idx: float(scores[idx]), reverse=True)
+    return clusters
