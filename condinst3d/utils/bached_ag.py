@@ -39,7 +39,7 @@ def batched_lbe(d: Dict[str, Tensor]) -> Dict[str, Tensor]:
       - anchor_strides [K,3]
       - classes [K]
       - scores [K]
-      - onehot_logits [K,1,H,W,D]  (probabilities)
+      - onehot_probs [K,1,H,W,D]  (probabilities)
       - bboxes [K,6]
     Output same keys but grouped+fused.
     """
@@ -67,17 +67,17 @@ def batched_lbe(d: Dict[str, Tensor]) -> Dict[str, Tensor]:
     comps = _connected_components(adj)
 
     # ---- fuse groups ----
-    out_centers, out_strides, out_classes, out_scores, out_logits, out_boxes = [], [], [], [], [], []
+    out_centers, out_strides, out_classes, out_scores, out_probs, out_boxes = [], [], [], [], [], []
 
     for idx in comps:
         scores = d["scores"][idx]
         classes = d["classes"][idx]
-        logits = d["onehot_logits"][idx]  # [g,1,H,W,D]
+        onehot_probs = d["onehot_probs"][idx]  # [g,1,H,W,D]
 
         w = torch.softmax(scores, dim=0)  # [g]
-        fused = (logits * w.view(-1, 1, 1, 1, 1)).sum(dim=0) / w.sum().clamp_min(1e-6)  # [1,H,W,D]
+        fused = (onehot_probs * w.view(-1, 1, 1, 1, 1)).sum(dim=0) / w.sum().clamp_min(1e-6)  # [1,H,W,D]
 
-        out_logits.append(fused)
+        out_probs.append(fused)
         out_centers.append(anchor_centers[idx].mean(dim=0))
         out_strides.append(anchor_strides[idx].mean(dim=0))
         out_classes.append(torch.mode(classes)[0])
@@ -91,7 +91,7 @@ def batched_lbe(d: Dict[str, Tensor]) -> Dict[str, Tensor]:
         "anchor_strides": torch.stack(out_strides, dim=0),
         "classes": torch.stack(out_classes, dim=0),
         "scores": torch.stack(out_scores, dim=0),
-        "onehot_logits": torch.stack(out_logits, dim=0),  # [G,1,H,W,D]
+        "onehot_probs": torch.stack(out_probs, dim=0),  # [G,1,H,W,D]
         "bboxes": torch.stack(out_boxes, dim=0),          # [G,6]
     }
     return out
