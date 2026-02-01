@@ -31,6 +31,7 @@ train:
   trainer:
     accelerator: gpu
     devices: [0, 1]
+    use_distributed_sampler: false
     precision: bf16-mixed
     max_epochs: 60
     gradient_clip_algorithm: norm
@@ -48,24 +49,24 @@ train:
 
 model:
   forward_chunk_size: 16
-  max_mask_to_train: 64
+  max_mask_to_train: 256
 
   backbone:
     _target_: condinst3d.arch.backbone.unetr_specific_mod.UNetRSpecificMod
 
     specific_modality_index: 3
     in_channels: 4
-    filters: [ 64, 96, 128, 160, 192, 256 ]
-    kernels: [ [ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ] ]
-    strides: [ [ 1,1,1 ],[ 2,2,1 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2 ] ]
+    filters: [ 32, 48, 64, 96, 128, 192, 256 ]
+    kernels: [ [ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3] ]
+    strides: [ [ 1,1,1 ],[ 2,2,1 ],[ 2,2,2 ],[ 2,2,1 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2] ]
     head_start_index: 2
-    heads_dim: 160
+    heads_dim: 96
     out_channels: 8
 
   matcher:
-    num_candidates: 8
+    num_candidates: 4
     center_in_gt: False
-    anchors_sizes: [ [4,4,2], [ 8,8,4 ], [ 16,16,8 ] ]
+    anchors_sizes: [ [4,4,2], [ 8,8,2 ], [ 16,16,4 ], [ 32,32,8 ] ]
 
   heads:
     classification:
@@ -89,9 +90,14 @@ model:
       gamma: 2.0
       reduction: none
     segmentation:
-      _target_: condinst3d.losses.dice.DiceLoss
-      reduction: "mean"     # none|mean|sum
-      from_logits: true     # set true if instance_logits are raw logits
+      _target_: condinst3d.losses.dice_bce.DiceBCELoss
+      lambda_dice: 1.0
+      lambda_bce: 0.2
+      fg_weight: 2.0           # helps small lesions (optional; 1.0 is fine)
+      eps: 1e-5
+      pos_weight: 2.0          # optional; set null to disable
+      reduction: "mean"
+      from_logits: true
 
   postproc:
     transforms: []
@@ -100,8 +106,8 @@ model:
     mask_thresh: 0.5
     score_thresh: 0.5
     nms_thresh: 0.5
+    group_thresh: 0.25
     topk_candidates: 40
-    detections_per_img: 50
 
   evaluation:
     iou_list: [ 0.01, 0.1, 0.2, 0.3, 0.4, 0.5 ]
@@ -148,9 +154,9 @@ data:
     test: 1
 
   empty_case_weight: 0.2
-  instance_weight_power: 0.7
+  instance_weight_power: 0.5
 
-  patch_size: [96, 96, 48]
-  patches_per_subject: 12
-  patch_overlap: 0.25
+  patch_size: [128, 128, 64]
+  patches_per_subject: 8
+  patch_overlap: 0.0
   augmentation_prob: 0.2

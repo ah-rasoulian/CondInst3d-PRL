@@ -25,7 +25,7 @@ from condinst3d.utils.mask import relabel_sequential
 from condinst3d.utils.anchors import AnisotropicATSSMatcher, generate_3d_anchors
 from condinst3d.arch.backbone.abstract import AbstractBackbone
 from condinst3d.utils.spatial import aligned_trilinear, merge_patch_logits_per_instance, get_patch_spatial_shapes
-from condinst3d.utils.bached_ag import batched_nms, batched_lbe
+from condinst3d.utils.bached_ag import batched_nms, aggregate_per_patch_detections
 from condinst3d.visualization.utils import get_stats
 from condinst3d.visualization.list_instance_boxseg_visualizer import ListInstanceBoxSegSliceVisualizer
 from condinst3d.evaluator.metrics.cfm_based import compute_precision, compute_fi, compute_recall
@@ -97,8 +97,7 @@ class CondInst3dPRL(pl.LightningModule):
         self.postproc_transform = Compose(postproc_transforms)
 
         # -------------------- inference/matching hyperparams --------------------
-        self.inference_hyperparams = {}
-        self.set_inference_params(cfg.inference)
+        self.inference_hyperparams = cfg.inference
 
         # -------------------- metrics --------------------
         self.metrics = nn.ModuleDict({
@@ -128,16 +127,6 @@ class CondInst3dPRL(pl.LightningModule):
                 "box_ap": AveragePrecision(iou_thresholds=eval_cfg.iou_list, interpolation=eval_cfg.ap_n_interp),
         })
         return metrics
-
-    def set_inference_params(self, infer_cfg: Dict):
-        params = {
-            "mask_thresh": float(infer_cfg.mask_thresh),
-            "score_thresh": float(infer_cfg.score_thresh),
-            "nms_thresh": float(infer_cfg.nms_thresh),
-            "topk_candidates": int(infer_cfg.topk_candidates),
-            "detections_per_img": int(infer_cfg.detections_per_img),
-        }
-        self.inference_hyperparams = params
 
     # ---------------- Viz helpers ----------------
     def _get_single_val_loader(self) -> DataLoader:
@@ -350,6 +339,7 @@ class CondInst3dPRL(pl.LightningModule):
         features = outputs["features"]
         cls_logits = outputs["cls_logits"]  # [N, A_total, C]
         device = cls_logits.device
+        offsets = outputs["offsets"] if outputs["offsets"] is not None else torch.zeros(N, 3, device=device)
 
         score_thresh = float(self.inference_hyperparams["score_thresh"])
         topk_candidates = int(self.inference_hyperparams["topk_candidates"])
@@ -455,51 +445,36 @@ class CondInst3dPRL(pl.LightningModule):
                     "classes": classes,
                     "scores": scores,
                     "keep_idxs": keep_idxs,
+                    "offset": offsets[i],
                 }
             )
 
         return detections, per_image_instances
 
     @torch.no_grad()
-    def compute_detections_and_segmentations(self, inputs: Tensor) -> List[Dict[str, Tensor]]:
+    def compute_detections_and_segmentations(self, inputs: Tensor) -> List[Dict[str, List[Tensor]]]:
         """
-            Returns a list length = batch_size (if patchified -> aggregated per original image),
-            else length = N.
-            Each element is a dict with keys:
-              - "anchor_centers": [K,3]
-              - "anchor_strides": [K,3]
-              - "classes":        [K]
-              - "scores":         [K]
-              - "onehot_probs":  [K,1,H,W,D]  (sigmoid output)
-              - "bboxes":         [K,6]        (computed from thresholded mask)
+        Returns: length = batch_size (B)
+          Each element is a dict with keys mapping to a list length = n_patches (P).
+          Each patch-list element is a Tensor (possibly empty) for that patch.
+
+        Expected inputs: [B, P, Ch, ph, pw, pd]
         """
-        output_shape = inputs.meta["dim"][1:4]  # (out_h,out_w,out_d)
-        out_h, out_w, out_d = map(int, output_shape)
-        h, w, d = inputs.shape[-3:]
+        output_shape = inputs.meta["dim"][1:4]
+        batch_size, n_patches = inputs.shape[:2]
 
-        n_patches = 0
-        batch_size = 1
-
-        patchified = (h < out_h) or (w < out_w) or (d < out_d)
-        if patchified:
-            if inputs.ndim == 6:  # [B,P,C,H,W,D]
-                batch_size, n_patches = inputs.shape[:2]
-                flat_inputs = inputs.reshape(batch_size * n_patches, *inputs.shape[-4:])
-            else:  # [P,C,H,W,D]
-                n_patches = inputs.shape[0]
-                batch_size = 1
-                flat_inputs = inputs.reshape(n_patches, *inputs.shape[-4:])
-        else:
-            flat_inputs = inputs
-            batch_size = inputs.shape[0]
-
-        device = flat_inputs.device
+        # Flatten patches -> [B*P, Ch, ph, pw, pd]
+        flat_inputs = inputs.reshape(batch_size * n_patches, *inputs.shape[-4:])
 
         outputs = self.forward(flat_inputs)
 
-        detections, per_image_instances = self._compute_detections(outputs)
+        # IMPORTANT: this must return per-(flattened)-patch detections in same order as flat_inputs
+        # detections: List[Dict[str, Tensor]] length = B*P
+        # per_patch_instances: whatever your InstanceList expects, aligned with detections
+        detections, per_patch_instances = self._compute_detections(outputs)
 
-        inst_list = InstanceList(per_image_instances, max_samples=-1)
+        inst_list = InstanceList(per_patch_instances, max_samples=-1)
+
         inst_logits = self.instance_segmentation_head(
             outputs["f_mask"],
             outputs["controller_logits"],
@@ -507,109 +482,74 @@ class CondInst3dPRL(pl.LightningModule):
         )
 
         stride = getattr(self.instance_segmentation_head, "stride", 1)
-        # upsample if needed (supports int or tuple stride)
         needs_upsample = (stride > 1) if isinstance(stride, int) else any(s > 1 for s in stride)
         if needs_upsample:
             inst_logits = aligned_trilinear(inst_logits, stride)
 
-        inst_probs = torch.sigmoid(inst_logits)  # [M,1,W,H,D]
-
-        img_idx = inst_list.get_image_indices()  # [M]
-        per_patch_probs: List[Tensor] = []
+        # Map instance logits back to each flattened patch index i in [0, B*P)
+        img_idx = inst_list.get_image_indices()  # [M] indices into detections list (0..B*P-1)
+        per_patch_logits: List[Tensor] = []
         for i in range(len(detections)):
             sel = (img_idx == i)
-            per_patch_probs.append(inst_probs[sel])
+            per_patch_logits.append(inst_logits[sel])  # [Ki,1,ph,pw,pd] (Ki may be 0)
 
         mask_thresh = float(self.inference_hyperparams["mask_thresh"])
         nms_thresh = float(self.inference_hyperparams["nms_thresh"])
+        group_thresh = float(self.inference_hyperparams["group_thresh"])
 
         detseg_per_patch: List[Dict[str, Tensor]] = []
         for i, det in enumerate(detections):
-            probs_i = per_patch_probs[i]  # [K,1,W,H,D]
-            bboxes = get_onehot_instance_mask_boxes(probs_i >= mask_thresh)  # [K,6]
+            logits_i = per_patch_logits[i]  # [K,1,ph,pw,pd] (logits)
+
+            # boxes computed from thresholded mask (on logits)
+            bboxes = get_onehot_instance_mask_boxes(torch.sigmoid(logits_i) >= mask_thresh)  # [K,6]
 
             out = {
                 "anchor_centers": det["anchor_centers"],
                 "anchor_strides": det["anchor_strides"],
                 "classes": det["classes"],
                 "scores": det["scores"],
-                "onehot_probs": probs_i,
+                "onehot_logits": logits_i,
                 "bboxes": bboxes,
+                "offset": det["offset"],  # should be per flattened patch
             }
 
             if out["scores"].numel() > 1:
                 keep = batched_nms(out["bboxes"], out["scores"], nms_thresh, metric="iom")
-                if not torch.is_tensor(keep):
-                    keep = torch.as_tensor(keep, device=device, dtype=torch.long)
-                for k in ("anchor_centers", "anchor_strides", "classes", "scores", "onehot_probs", "bboxes"):
+                for k in ("anchor_centers", "anchor_strides", "classes", "scores", "onehot_logits", "bboxes"):
                     out[k] = out[k][keep]
 
             detseg_per_patch.append(out)
 
-        if not patchified:
-            return detseg_per_patch
-
-        offsets = inputs.meta["location"]
-        if isinstance(offsets, (list, tuple, np.ndarray)):
-            offsets = torch.as_tensor(offsets, device=device)
-        if offsets.ndim == 2 and offsets.shape[0] == 3:
-            offsets = offsets.T  # [total_patches,3]
-        offsets = offsets.to(device=device)
-
-        aggregated: List[Dict[str, Tensor]] = []
-        total_patches = batch_size * n_patches
-        assert len(detseg_per_patch) == total_patches
-
-        patch_spatial_shapes = get_patch_spatial_shapes(inputs, 0, total_patches).to(device=device)
-
+        # -------- Unflatten: [B*P] -> per-image list of per-patch outputs --------
+        # We return per image a dict of lists (each list has length P)
+        per_image: List[Dict[str, List[Tensor]]] = []
         for b in range(batch_size):
-            start, end = b * n_patches, (b + 1) * n_patches
-            patch_outs = detseg_per_patch[start:end]
-            patch_offsets = offsets[start:end]
-            patch_shapes = patch_spatial_shapes[start:end]
+            per_image.append({
+                "output_shape": output_shape,
+                "anchor_centers": [],
+                "anchor_strides": [],
+                "classes": [],
+                "scores": [],
+                "onehot_logits": [],
+                "bboxes": [],
+                "offset": [],
+            })
 
-            centers_list, strides_list, classes_list, scores_list, bboxes_list, logits_list = [], [], [], [], [], []
+        for flat_i, out in enumerate(detseg_per_patch):
+            b = flat_i // n_patches
+            p = flat_i % n_patches
+            # keep patch order stable (append in order)
+            per_image[b]["anchor_centers"].append(out["anchor_centers"])
+            per_image[b]["anchor_strides"].append(out["anchor_strides"])
+            per_image[b]["classes"].append(out["classes"])
+            per_image[b]["scores"].append(out["scores"])
+            per_image[b]["onehot_logits"].append(out["onehot_logits"])
+            per_image[b]["bboxes"].append(out["bboxes"])
+            per_image[b]["offset"].append(out["offset"])
 
-            for det, off in zip(patch_outs, patch_offsets):
-                off = off.to(dtype=torch.float32)
-
-                centers_list.append(det["anchor_centers"] + off[None, :])
-                strides_list.append(det["anchor_strides"])
-                classes_list.append(det["classes"])
-                scores_list.append(det["scores"])
-
-                bb = det["bboxes"].clone()
-                bb[:, :3] += off[None, :]
-                bb[:, 3:] += off[None, :]
-                bboxes_list.append(bb)
-
-                logits_list.append(det["onehot_probs"])
-
-            merged = {
-                "anchor_centers": torch.cat(centers_list, dim=0) if centers_list else torch.empty((0, 3),
-                                                                                                  device=device),
-                "anchor_strides": torch.cat(strides_list, dim=0) if strides_list else torch.empty((0, 3),
-                                                                                                  device=device),
-                "classes": torch.cat(classes_list, dim=0) if classes_list else torch.empty((0,), device=device,
-                                                                                           dtype=torch.long),
-                "scores": torch.cat(scores_list, dim=0) if scores_list else torch.empty((0,), device=device,
-                                                                                        dtype=torch.float32),
-                "bboxes": torch.cat(bboxes_list, dim=0) if bboxes_list else torch.empty((0, 6), device=device,
-                                                                                        dtype=torch.float32),
-            }
-
-            merged["onehot_probs"] = merge_patch_logits_per_instance(
-                patches=logits_list,
-                like_shape=(merged["scores"].numel(), 1, out_h, out_w, out_d),
-                patch_offsets=patch_offsets,
-                patch_spatial_shapes=patch_shapes,
-                device=device,
-            )
-
-            merged = batched_lbe(merged)
-            aggregated.append(merged)
-
-        return aggregated
+        detseg_per_image = [aggregate_per_patch_detections(x, group_thresh, mask_thresh) for x in per_image]
+        return detseg_per_image
 
     @torch.no_grad()
     def postprocess(self, detections_and_segmentations: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
@@ -626,7 +566,7 @@ class CondInst3dPRL(pl.LightningModule):
                 # ensure expected keys exist
                 H, W, D = onehot_probs.shape[-3:]
                 per_img["bboxes"] = onehot_probs.new_zeros((0, 6), dtype=torch.float32)
-                per_img["onehot_mask"] = onehot_probs.new_zeros((0, 1, H, W, D), dtype=torch.bool)
+                per_img["onehot_instance_mask"] = onehot_probs.new_zeros((0, 1, H, W, D), dtype=torch.bool)
                 per_img["instance_mask"] = onehot_probs.new_zeros((H, W, D), dtype=torch.long)
                 out.append(per_img)
                 continue
@@ -643,7 +583,7 @@ class CondInst3dPRL(pl.LightningModule):
                 H, W, D = onehot.shape[-3:]
                 empty = keep_idx  # [0]
                 per_img = {k: v[empty] for k, v in per_img.items()}
-                per_img["onehot_mask"] = onehot[empty]
+                per_img["onehot_instance_mask"] = onehot[empty]
                 per_img["bboxes"] = onehot.new_zeros((0, 6), dtype=torch.float32)
                 per_img["instance_mask"] = onehot.new_zeros((H, W, D), dtype=torch.long)
                 out.append(per_img)
@@ -676,7 +616,7 @@ class CondInst3dPRL(pl.LightningModule):
             instance_mask = relabel_sequential(instance_mask, exclude_background=True)
             mutually_exclusive_onehot = instance_mask_to_onehot(instance_mask)
 
-            per_img["onehot_mask"] = mutually_exclusive_onehot
+            per_img["onehot_instance_mask"] = mutually_exclusive_onehot
             per_img["instance_mask"] = instance_mask
 
             out.append(per_img)
@@ -688,11 +628,20 @@ class CondInst3dPRL(pl.LightningModule):
         # using chunks to reduce GPU memory usage
         chunk_size = int(self.forward_chunk_size)
         b_size = inputs.shape[0]
+        shape = inputs.shape
+        device = inputs.device
+        offsets = None
 
         is_meta_tensor = isinstance(inputs, MetaTensor)
         if is_meta_tensor:
             input_meta = inputs.meta
             inputs = inputs.as_tensor()
+            offsets = input_meta["location"]
+            if isinstance(offsets, (list, tuple, np.ndarray)):
+                offsets = torch.as_tensor(offsets, device=inputs.device)
+            if offsets.ndim == 2 and offsets.shape[0] == 3:
+                offsets = offsets.T  # [total_patches,3]
+            offsets = offsets.to(device=inputs.device)
 
         chunked_outputs = []
         for i in range(0, b_size, chunk_size):
@@ -722,10 +671,17 @@ class CondInst3dPRL(pl.LightningModule):
                 torch.cat([c["features"][j] for c in chunked_outputs], dim=0)
                 for j in range(len(self.anchors_sizes))
             ],
-            "shape": inputs.shape,
-            "device": inputs.device,
+            "offsets": offsets,
+            "shape": shape,
+            "device": device,
         }
         return outputs
+
+    def on_train_epoch_start(self):
+        dl = self.trainer.train_dataloader
+        sampler = getattr(dl, "sampler", None)
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(self.trainer.current_epoch)
 
     # ---------------- Train / Val ----------------
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
@@ -769,7 +725,7 @@ class CondInst3dPRL(pl.LightningModule):
         # ---------------- metrics (fast) ----------------
         for i, det in enumerate(preds):
             # ---------- masks ----------
-            pred_onehot = det["onehot_mask"]  # [K,1,H,W,D] bool (postprocessed)
+            pred_onehot = det["onehot_instance_mask"]  # [K,1,H,W,D] bool (postprocessed)
             scores = det["scores"]  # [K]
             gt_onehot = targets[i]["onehot"]  # [G,1,H,W,D] or [G,H,W,D]
 
@@ -783,7 +739,7 @@ class CondInst3dPRL(pl.LightningModule):
             else:
                 pred_onehot_eval = pred_onehot
 
-            pairwise_mask_iou = mask_intersection_over_union(pred_onehot_eval, gt_onehot_eval)
+            pairwise_mask_iou = mask_intersection_over_union(pred_onehot_eval, gt_onehot_eval, max_chunk_size=32)
             metric_dict["mask_cfm"].update(pairwise_mask_iou)
             metric_dict["mask_ap"].update(pairwise_mask_iou, scores)
 
@@ -818,7 +774,7 @@ class CondInst3dPRL(pl.LightningModule):
             else:
                 gt_onehot_eval = gt_onehot
 
-            pred_onehot = det["onehot_mask"]
+            pred_onehot = det["onehot_instance_mask"]
             pred_onehot_eval = pred_onehot.squeeze(1) if (
                         pred_onehot.ndim == 5 and pred_onehot.shape[1] == 1) else pred_onehot
 
@@ -975,7 +931,7 @@ class CondInst3dPRL(pl.LightningModule):
     def predict_step(self, batch: dict, batch_idx, dataloader_idx=0) -> Any:
         inputs = batch["inputs"]
         det = self.compute_detections_and_segmentations(inputs)
-        det = self.postprocess(det)
+        # det = self.postprocess(det)
         return det
 
     # ---------------- Optimizers ----------------
