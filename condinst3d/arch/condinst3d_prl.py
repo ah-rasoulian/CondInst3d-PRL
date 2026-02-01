@@ -436,6 +436,7 @@ class CondInst3dPRL(pl.LightningModule):
                         "classes": empty_classes,
                         "scores": empty_scores,
                         "keep_idxs": empty_keep,
+                        "offset": offsets[i],
                     }
                 )
                 continue
@@ -527,7 +528,7 @@ class CondInst3dPRL(pl.LightningModule):
                 "scores": det["scores"],
                 "onehot_logits": logits_i,
                 "bboxes": bboxes,
-                "offset": det["offset"],  # should be per flattened patch
+                "offset": det["offset"],
             }
 
             if out["scores"].numel() > 1:
@@ -652,7 +653,10 @@ class CondInst3dPRL(pl.LightningModule):
         if is_meta_tensor:
             input_meta = inputs.meta
             inputs = inputs.as_tensor()
-            offsets = input_meta["location"]
+            if "location" in input_meta:
+                offsets = input_meta["location"]
+            else:
+                offsets = input_meta["crop_center"]
             if isinstance(offsets, (list, tuple, np.ndarray)):
                 offsets = torch.as_tensor(offsets, device=inputs.device)
             if offsets.ndim == 2 and offsets.shape[0] == 3:
