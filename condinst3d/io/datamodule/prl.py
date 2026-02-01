@@ -11,7 +11,7 @@ import os
 from monai.transforms import (
     Compose,
     LoadImaged, Lambdad, EnsureChannelFirstd, EnsureTyped, ConcatItemsd, DeleteItemsd,
-    Orientationd, NormalizeIntensityd,
+    Orientationd, NormalizeIntensityd, CenterSpatialCropd,
     RandCropByLabelClassesd, RandSpatialCropd, SpatialPadd, GridPatchd,
     RandRotated, RandZoomd, RandFlipd, OneOf, RandRicianNoised, RandGaussianNoised,
     RandScaleIntensityd, RandShiftIntensityd, RandAdjustContrastd, RandGaussianSharpend, CopyItemsd,
@@ -114,6 +114,8 @@ class PRLDataModule(pl.LightningDataModule):
             ConcatItemsd(keys=self.modalities, name="inputs", dim=0),
             # delete individual mods
             DeleteItemsd(keys=self.modalities),
+            # center cropping background
+            CenterSpatialCropd(keys=["inputs", "instance_mask"], roi_size=(192, 240, 72)),
             # make torch tensors + meta, put on correct dtype
             EnsureTyped(keys=["inputs"], dtype=torch.float32, track_meta=True),
             # normalize modality intensities

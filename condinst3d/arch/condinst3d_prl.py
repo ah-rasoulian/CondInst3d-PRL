@@ -42,6 +42,21 @@ def _safe_mean(x: Tensor) -> Tensor:
     # some AP implementations return shape [T] or [T, ...]
     return x.mean() if x.numel() else x.new_tensor(0.0)
 
+def _ensure_boxes_2d(boxes: torch.Tensor, name: str) -> torch.Tensor:
+    # Accept empty [0,6], [6], or [G,6]
+    if boxes.numel() == 0:
+        return boxes.reshape(0, 6)
+    if boxes.ndim == 1:
+        boxes = boxes.unsqueeze(0)
+    assert boxes.ndim == 2 and boxes.shape[1] == 6, f"{name} must be [N,6], got {tuple(boxes.shape)}"
+    return boxes
+
+
+def _squeeze_onehot(onehot: torch.Tensor) -> torch.Tensor:
+    # Normalize to [N,H,W,D]
+    if onehot.ndim == 5 and onehot.shape[1] == 1:
+        return onehot.squeeze(1)
+    return onehot
 
 class CondInst3dPRL(pl.LightningModule):
     """
@@ -460,7 +475,8 @@ class CondInst3dPRL(pl.LightningModule):
 
         Expected inputs: [B, P, Ch, ph, pw, pd]
         """
-        output_shape = inputs.meta["dim"][1:4]
+        # output_shape = inputs.meta["dim"][1:4]
+        output_shape = np.array([192, 240, 72])
         batch_size, n_patches = inputs.shape[:2]
 
         # Flatten patches -> [B*P, Ch, ph, pw, pd]
@@ -722,82 +738,75 @@ class CondInst3dPRL(pl.LightningModule):
 
         metric_dict = self.metrics["validation"]
 
-        # ---------------- metrics (fast) ----------------
-        for i, det in enumerate(preds):
-            # ---------- masks ----------
-            pred_onehot = det["onehot_instance_mask"]  # [K,1,H,W,D] bool (postprocessed)
+        # -------- metrics (fast path) --------
+        for det, tgt in zip(preds, targets):
             scores = det["scores"]  # [K]
-            gt_onehot = targets[i]["onehot"]  # [G,1,H,W,D] or [G,H,W,D]
 
-            if gt_onehot.ndim == 5 and gt_onehot.shape[1] == 1:
-                gt_onehot_eval = gt_onehot.squeeze(1)  # [G,H,W,D]
-            else:
-                gt_onehot_eval = gt_onehot
+            # --- masks ---
+            pred_onehot = _squeeze_onehot(det["onehot_instance_mask"])  # [K,H,W,D]
+            gt_onehot = _squeeze_onehot(tgt["onehot"])  # [G,H,W,D]
 
-            if pred_onehot.ndim == 5 and pred_onehot.shape[1] == 1:
-                pred_onehot_eval = pred_onehot.squeeze(1)  # [K,H,W,D]
-            else:
-                pred_onehot_eval = pred_onehot
-
-            pairwise_mask_iou = mask_intersection_over_union(pred_onehot_eval, gt_onehot_eval, max_chunk_size=32)
+            pairwise_mask_iou = mask_intersection_over_union(
+                pred_onehot, gt_onehot, max_chunk_size=32
+            )
             metric_dict["mask_cfm"].update(pairwise_mask_iou)
             metric_dict["mask_ap"].update(pairwise_mask_iou, scores)
 
-            # ---------- boxes ----------
-            gt_boxes = targets[i]["boxes"]
-            if gt_boxes.ndim == 1:
-                gt_boxes = gt_boxes.unsqueeze(0)
-            assert gt_boxes.ndim == 2 and gt_boxes.shape[1] == 6, f"gt_boxes must be [G,6], got {gt_boxes.shape}"
-
-            pred_boxes = det["bboxes"]
-            if pred_boxes.ndim == 1:
-                pred_boxes = pred_boxes.unsqueeze(0)
-            assert pred_boxes.ndim == 2 and pred_boxes.shape[
-                1] == 6, f"pred_boxes must be [K,6], got {pred_boxes.shape}"
+            # --- boxes ---
+            pred_boxes = _ensure_boxes_2d(det["bboxes"], "pred_boxes")
+            gt_boxes = _ensure_boxes_2d(tgt["boxes"], "gt_boxes")
 
             pairwise_box_iou = box_intersection_over_union(pred_boxes, gt_boxes)  # [K,G]
             metric_dict["box_cfm"].update(pairwise_box_iou)
             metric_dict["box_ap"].update(pairwise_box_iou, scores)
 
-        # ---------------- visualization (only on selected batches) ----------------
-        if not (self.trainer.is_global_zero and batch_idx in set(self.images_to_visualize.get(0, []))):
+        # -------- visualization gate --------
+        vis_indices = set(self.images_to_visualize.get(0, []))
+        do_vis = self.trainer.is_global_zero and (batch_idx in vis_indices)
+        if not do_vis:
             return preds
 
-        # Full original input (no patch stitching)
-        inputs_full = batch["inputs_orig"]  # [B,C,H,W,D] (preferably)
+        # Prefer full-volume input for plotting (no patch stitching)
+        inputs_full = batch.get("inputs_orig", batch.get("inputs", None))
         cases = batch.get("case", None)
 
-        for i, det in enumerate(preds):
-            gt_onehot = targets[i]["onehot"]
-            if gt_onehot.ndim == 5 and gt_onehot.shape[1] == 1:
-                gt_onehot_eval = gt_onehot.squeeze(1)
-            else:
-                gt_onehot_eval = gt_onehot
+        # If inputs_full is missing, skip gracefully (still return preds)
+        if inputs_full is None:
+            return preds
 
-            pred_onehot = det["onehot_instance_mask"]
-            pred_onehot_eval = pred_onehot.squeeze(1) if (
-                        pred_onehot.ndim == 5 and pred_onehot.shape[1] == 1) else pred_onehot
+        for i, (det, tgt) in enumerate(zip(preds, targets)):
+            scores = det["scores"]
 
-            pairwise_mask_iou = mask_intersection_over_union(pred_onehot_eval, gt_onehot_eval)
-            stats = get_stats(pairwise_mask_iou, scores=det["scores"])
+            gt_onehot = _squeeze_onehot(tgt["onehot"])
+            pred_onehot = _squeeze_onehot(det["onehot_instance_mask"])
+
+            y_true = onehot_to_instance_mask(gt_onehot)
+            y_pred = det["instance_mask"]
+
+            true_ids = torch.unique(y_true)
+            true_ids = true_ids[true_ids > 0]
+            pred_ids = torch.unique(y_pred)
+            pred_ids = pred_ids[pred_ids > 0]
+
+            pairwise_mask_iou = mask_intersection_over_union(pred_onehot, gt_onehot)
+            stats = get_stats(pairwise_mask_iou, y_true_ids=true_ids, y_pred_ids=pred_ids, scores=scores)
 
             title = str(cases[i]) if cases is not None else f"idx={i}"
 
             figs = self.instance_head_visualizer.plot(
                 inputs=inputs_full[i],
-                y_pred=det["instance_mask"],
-                y_true=onehot_to_instance_mask(gt_onehot_eval),
+                y_pred=y_pred,
+                y_true=y_true,
                 stats=[stats],
                 title=title,
                 add_info_text=True,
-                boxes_true=targets[i].get("boxes", None),
+                boxes_true=tgt.get("boxes", None),
                 boxes_pred=det.get("bboxes", None),
                 boxes_scores=det.get("scores", None),
             )
 
             for t, fig in figs.items():
-                fig_name = f"Images-{title}/{t}"
-                self._log_figure(fig_name, fig)
+                self._log_figure(f"Images-{title}/{t}", fig)
                 try:
                     import matplotlib.pyplot as plt
                     plt.close(fig)

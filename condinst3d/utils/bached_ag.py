@@ -2,6 +2,7 @@ from typing import Literal, Dict, Optional, Callable, List
 import torch
 from torch import Tensor
 from condinst3d.evaluator.iou import box_intersection_over_union, box_intersection_over_minimum
+from monai.transforms.utils import get_unique_labels
 
 
 class _UnionFind:
@@ -282,11 +283,14 @@ def aggregate_per_patch_detections(
         onehot_global[k, 0, gx1:gx2, gy1:gy2, gz1:gz2] = tmp
         instance_mask[0, gx1:gx2, gy1:gy2, gz1:gz2][tmp] = (k + 1)
 
+    remained_instances = list(get_unique_labels(instance_mask, is_onehot=False, discard=0))
+    remained_indices = [x - 1 for x in remained_instances]  # undo the effect of background class
+
     return {
         "instance_mask": instance_mask,             # [1,H,W,D]
-        "onehot_instance_mask": onehot_global,      # [G,1,H,W,D]
-        "bboxes": group_boxes,                      # [G,6] (sorted low->high score)
-        "centers": group_centers,                   # [G,3]
-        "strides": group_strides,                   # [G,3]
-        "scores": group_scores,                     # [G]
+        "onehot_instance_mask": onehot_global[remained_indices],      # [G,1,H,W,D]
+        "bboxes": group_boxes[remained_indices],                      # [G,6] (sorted low->high score)
+        "centers": group_centers[remained_indices],                   # [G,3]
+        "strides": group_strides[remained_indices],                   # [G,3]
+        "scores": group_scores[remained_indices],                     # [G]
     }

@@ -1,30 +1,49 @@
 from torch import Tensor
+import torch
 import numpy as np
 from skimage.segmentation import relabel_sequential
 import skimage.measure as measure
 
 
-def get_stats(pairwise_iou: Tensor, scores: Tensor | None = None):
-    pairwise_iou = pairwise_iou.cpu()
-    stats = {"y_true": {}, "y_pred": {}}
-    for gt_idx in range(pairwise_iou.size(1)):
-        per_gt_iou = pairwise_iou[:, gt_idx]
-        if sum(per_gt_iou) == 0:
-            stats["y_true"][gt_idx + 1] = {'type': 'FN'}
+def get_stats(pairwise_iou: Tensor, y_true_ids: Tensor, y_pred_ids: Tensor, scores: Tensor | None = None):
+    """
+    pairwise_iou: [K,G] where row k corresponds to y_pred_ids[k],
+                  col g corresponds to y_true_ids[g]
+    y_true_ids: [G] label values present in y_true (excluding 0)
+    y_pred_ids: [K] label values present in y_pred (excluding 0)
+    scores: [K] aligned with rows (same order as y_pred_ids)
+    """
+    pairwise_iou = pairwise_iou.detach().cpu()
+    y_true_ids = y_true_ids.detach().cpu().tolist()
+    y_pred_ids = y_pred_ids.detach().cpu().tolist()
 
-    for pred_idx in range(pairwise_iou.size(0)):
-        per_pred_iou = pairwise_iou[pred_idx]
+    stats = {"y_true": {}, "y_pred": {}}
+
+    # FN: GT with no overlap with any pred
+    for g, gt_id in enumerate(y_true_ids):
+        per_gt = pairwise_iou[:, g]
+        if float(per_gt.sum()) == 0.0:
+            stats["y_true"][int(gt_id)] = {"type": "FN"}
+
+    # FP/TP per prediction
+    for k, pred_id in enumerate(y_pred_ids):
+        per_pred = pairwise_iou[k]
         s = {}
         if scores is not None:
-            s['score'] = scores[pred_idx].item()
-        if sum(per_pred_iou) == 0:
-            s = s | {'type': 'FP'}
-            stats["y_pred"][pred_idx + 1] = s
+            s["score"] = float(scores[k].item())
+
+        if float(per_pred.sum()) == 0.0:
+            stats["y_pred"][int(pred_id)] = {**s, "type": "FP"}
         else:
-            tp_indices = np.nonzero(per_pred_iou)[0]
-            tp_indices = tp_indices.reshape(-1)
-            s = s | {'type': 'TP', 'regions': tp_indices + 1, 'iou': per_pred_iou[tp_indices]}
-            stats["y_pred"][pred_idx + 1] = s
+            tp_cols = torch.nonzero(per_pred > 0, as_tuple=False).view(-1).cpu().numpy()
+            regions = [int(y_true_ids[c]) for c in tp_cols]
+            stats["y_pred"][int(pred_id)] = {
+                **s,
+                "type": "TP",
+                "regions": regions,          # actual GT label ids
+                "iou": per_pred[tp_cols],    # tensor on CPU
+            }
+
     return stats
 
 
