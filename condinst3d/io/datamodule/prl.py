@@ -21,8 +21,6 @@ from condinst3d.io.transforms import LoadJSONd, InstanceMaskToOneHotd, OneHotToB
 from condinst3d.io.collate import multi_instance_collate
 from condinst3d.io.sampler import DistributedWeightedSampler
 from functools import partial
-from pytorch_lightning.utilities import rank_zero_only
-import torch.distributed as dist
 
 
 def build_cases(cases, modalities, image_directory, label_directory):
@@ -118,6 +116,7 @@ class PRLDataModule(pl.LightningDataModule):
             CenterSpatialCropd(keys=["inputs", "instance_mask"], roi_size=(192, 240, 72)),
             # make torch tensors + meta, put on correct dtype
             EnsureTyped(keys=["inputs"], dtype=torch.float32, track_meta=True),
+            EnsureTyped(keys=["instance_mask"], dtype=torch.int16, track_meta=False),
             # normalize modality intensities
             NormalizeIntensityd(keys=["inputs"], channel_wise=True),
         ]
@@ -223,7 +222,7 @@ class PRLDataModule(pl.LightningDataModule):
             ),
         ]
 
-    def _get_det_transforms(self, stage=Literal['train', 'val']):
+    def _get_det_transforms(self):
         return [
             # create a onehot mask for instance mask
             InstanceMaskToOneHotd(keys=['instance_mask'], out_key='onehot', include_background=False),
