@@ -33,19 +33,16 @@ train:
     devices: [0, 1]
     use_distributed_sampler: false
     precision: bf16-mixed
-    max_epochs: 60
+    max_epochs: 1000
     gradient_clip_algorithm: norm
-    gradient_clip_val: 0.5
+    gradient_clip_val: 1.0
     accumulate_grad_batches: 4
     num_sanity_val_steps: 0
-    check_val_every_n_epoch: 5
+    check_val_every_n_epoch: 20
     log_every_n_steps: 1
     limit_train_batches: 1.0
     limit_val_batches: 1.0
     enable_progress_bar: true
-    # set true only if you want deterministic algos on torch side too
-    deterministic: false
-#    overfit_batches: 2
 
 model:
   forward_chunk_size: 16
@@ -61,10 +58,10 @@ model:
     strides: [ [ 1,1,1 ],[ 2,2,1 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2] ]
     head_start_index: 2
     heads_dim: 128
-    out_channels: 8
+    out_channels: 16
 
   matcher:
-    num_candidates: 6
+    num_candidates: 12
     center_in_gt: False
     anchors_sizes: [ [4,4,2], [ 8,8,4 ], [ 16,16,8 ] ]
 
@@ -89,24 +86,30 @@ model:
       alpha: 0.25
       gamma: 2.0
       reduction: none
-    segmentation:
-      _target_: condinst3d.losses.dice_bce.DiceBCELoss
-      lambda_dice: 1.0
-      lambda_bce: 0.2
-      fg_weight: 2.0           # helps small lesions (optional; 1.0 is fine)
-      eps: 1e-5
-      pos_weight: 2.0          # optional; set null to disable
+
+    instance_segmentation:
+      _target_: condinst3d.losses.dice_focal.DiceFocalLoss
+      alpha: 0.25
+      gamma: 2.0
       reduction: "mean"
-      from_logits: true
+
+    semantic_segmentation:
+      _target_: monai.losses.DiceFocalLoss
+      include_background: false
+      softmax: true
+      reduction: "mean"
+      to_onehot_y: True
+      gamma: 2.0
+      alpha: 0.25
 
   postproc:
     transforms: []
 
   inference:
-    mask_thresh: 0.5
-    score_thresh: 0.5
+    mask_thresh: 0.4
+    score_thresh: 0.35
     nms_thresh: 0.5
-    group_thresh: 0.25
+    group_thresh: 0.5
     topk_candidates: 40
 
   evaluation:
@@ -116,8 +119,8 @@ model:
   visualization:
     img_channels: ['t1w', 't2w', 'flr', 'freqmap']
     channel_seg_under_image: 3
-    crop_size: [64, 64]
-    show_slices: [-2, -1, 0, 1, 2]
+    crop_size: [96, 96]
+    show_slices: [-1, 0, 1]
     figsize: 2.0
     num_images_to_show: 16
 
@@ -131,7 +134,7 @@ model:
 
     scheduler:
       _target_: torch.optim.lr_scheduler.MultiStepLR
-      milestones: [ 16, 36, 48 ]
+      milestones: [ 30, 60, 100, 150 ]
       gamma: 0.1
 
     scheduler_cfg:
@@ -153,10 +156,11 @@ data:
     val: 1
     test: 1
 
-  empty_case_weight: 0.5
-  instance_weight_power: 0.5
+  empty_case_weight: 0.2
+  instance_weight_power: 0.7
 
+  roi_size: [192, 240, 72]
   patch_size: [96, 96, 48]
-  patches_per_subject: 16
+  patches_per_subject: 4
   patch_overlap: 0.25
   augmentation_prob: 0.2
