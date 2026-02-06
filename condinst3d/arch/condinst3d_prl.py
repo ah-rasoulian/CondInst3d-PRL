@@ -97,13 +97,18 @@ class CondInst3dPRL(pl.LightningModule):
             in_channels=self.backbone.heads_dim,
             num_params=self.instance_segmentation_head.num_params
         )
+        self.semantic_head = nn.Sequential(
+            nn.GroupNorm(num_groups=min(4, self.backbone.out_channels), num_channels=self.backbone.out_channels),
+            nn.LeakyReLU(),
+            nn.Conv3d(self.backbone.out_channels, cfg.heads.classification.num_classes + 1, kernel_size=3, padding='same')
+        )
 
         # -------------------- loss functions ---------------------
         self.losses = {
             "classification": instantiate(cfg.losses.classification),
-            "segmentation": instantiate(cfg.losses.segmentation),
+            "instance_segmentation": instantiate(cfg.losses.instance_segmentation),
+            "semantic_segmentation": instantiate(cfg.losses.semantic_segmentation),
         }
-        self.neg_pos_ratio = cfg.losses.neg_pos_ratio
 
         # -------------------- postproc params --------------------
         postproc_transforms = [Lambda(func=lambda x: x)]
@@ -219,9 +224,7 @@ class CondInst3dPRL(pl.LightningModule):
 
         return instance_data_list
 
-
-    # ---------------- Losses ----------------
-    def _compute_detection_loss(self, outputs, targets):
+    def _get_gt_instance_data_list(self, outputs, targets):
         features = outputs["features"]
 
         anchors_per_level = generate_3d_anchors(
@@ -231,52 +234,90 @@ class CondInst3dPRL(pl.LightningModule):
             device=outputs["device"],
         )
 
-        instance_data_list = self._match_anchors_atss(anchors_per_level, targets)
+        instance_data_list = self._match_anchors_atss(
+            anchors_per_level, targets, spacing=outputs["spacing"]
+        )
+        return instance_data_list
+
+    # ---------------- Losses ----------------
+    def _compute_detection_loss(self, outputs, targets):
+        instance_data_list = self._get_gt_instance_data_list(outputs, targets)
 
         cls_logits = outputs["cls_logits"]  # [B, A, C]
+        B, A, C = cls_logits.shape
+        device = cls_logits.device
 
-        all_gt_class_ids = torch.stack([x.gt_classes for x in instance_data_list])  # [B, A]
-        foreground_mask = all_gt_class_ids >= 0  # [B, A]
+        all_gt_class_ids = torch.stack([x.gt_classes for x in instance_data_list], dim=0)  # [B, A]
+        pos_mask = all_gt_class_ids >= 0  # [B, A]
+        neg_mask = ~pos_mask
 
-        num_foreground = int(foreground_mask.sum().item())
-
+        # --- build onehot targets (only set positives) ---
         gt_onehot = torch.zeros_like(cls_logits)
-
-        if num_foreground > 0:
-            b_idx, a_idx = foreground_mask.nonzero(as_tuple=True)
-            c_idx = all_gt_class_ids[b_idx, a_idx].long()
+        if pos_mask.any():
+            b_idx, a_idx = pos_mask.nonzero(as_tuple=True)  # [Npos]
+            c_idx = all_gt_class_ids[b_idx, a_idx].long().clamp_(0, C - 1)
             gt_onehot[b_idx, a_idx, c_idx] = 1.0
 
-        # loss per entry [B,A,C] because reduction="none"
+        # --- per-entry loss (expects reduction="none") ---
+        # returns [B, A, C] typically
         loss_per_entry = self.losses["classification"](cls_logits, gt_onehot)
 
-        # reduce class dim -> per-anchor loss [B,A]
+        # reduce class dim -> [B, A]
         loss_per_anchor = loss_per_entry.sum(dim=-1)
 
-        # ---- hard negative sampling ----
-        neg_mask = ~foreground_mask  # [B,A]
-        neg_pos_ratio = getattr(self, "neg_pos_ratio", 3)
-        # number of negatives to keep
-        num_neg = int(min(int(neg_mask.sum().item()), neg_pos_ratio * max(1, num_foreground)))
+        # ---------------- per-image hard negative mining ----------------
+        neg_pos_ratio = int(getattr(self.cfg.losses, "neg_pos_ratio", 3)) if hasattr(self, "cfg") else 3
+        max_neg_per_image = int(getattr(self.cfg.losses, "max_neg_per_image", 5000)) if hasattr(self, "cfg") else 5000
 
-        if num_neg > 0:
-            # pick hardest negatives by loss
-            neg_losses = loss_per_anchor[neg_mask]  # [Nneg_total]
-            topk_vals, topk_idx = torch.topk(neg_losses, k=num_neg, largest=True, sorted=False)
+        # How many positives per image?
+        num_pos_per_img = pos_mask.sum(dim=1)  # [B]
 
-            # build a mask for selected negatives
-            selected = torch.zeros_like(neg_mask, dtype=torch.bool)
-            neg_indices = neg_mask.nonzero(as_tuple=False)  # [Nneg_total, 2]
-            selected_neg_indices = neg_indices[topk_idx]  # [num_neg, 2]
-            selected[selected_neg_indices[:, 0], selected_neg_indices[:, 1]] = True
-        else:
-            selected = torch.zeros_like(neg_mask, dtype=torch.bool)
+        # How many negatives to keep per image?
+        # keep at least some negatives even when num_pos=0
+        min_neg_when_no_pos = int(getattr(self.cfg.losses, "min_neg_when_no_pos", 50)) if hasattr(self, "cfg") else 50
 
-        # final mask = all positives + selected negatives
-        sample_mask = foreground_mask | selected
+        num_neg_per_img = neg_pos_ratio * torch.clamp(num_pos_per_img, min=1)  # [B]
+        num_neg_per_img = torch.minimum(num_neg_per_img, neg_mask.sum(dim=1))  # can't exceed available negs
+        num_neg_per_img = torch.clamp(num_neg_per_img, max=max_neg_per_image)
 
-        denom = int(sample_mask.sum().item())
-        loss_cls = loss_per_anchor[sample_mask].sum() / max(1, denom)
+        # if an image has 0 positives, keep a small fixed number of negatives
+        no_pos = (num_pos_per_img == 0)
+        if no_pos.any():
+            num_neg_per_img = num_neg_per_img.clone()
+            num_neg_per_img[no_pos] = torch.minimum(
+                neg_mask.sum(dim=1)[no_pos],
+                torch.as_tensor(min_neg_when_no_pos, device=device, dtype=num_neg_per_img.dtype),
+            )
+
+        # build selected negatives mask
+        selected_neg = torch.zeros((B, A), device=device, dtype=torch.bool)
+
+        # detach mining signal so selection doesn't backprop
+        mining_scores = loss_per_anchor.detach()
+
+        # loop over batch (B is small; A is huge, so this is fine)
+        for b in range(B):
+            k = int(num_neg_per_img[b].item())
+            if k <= 0:
+                continue
+            neg_idx = torch.where(neg_mask[b])[0]  # [Nneg_b]
+            if neg_idx.numel() == 0:
+                continue
+            neg_losses_b = mining_scores[b, neg_idx]  # [Nneg_b]
+
+            if k < neg_idx.numel():
+                topk = torch.topk(neg_losses_b, k=k, largest=True, sorted=False).indices
+                chosen = neg_idx[topk]
+            else:
+                chosen = neg_idx
+
+            selected_neg[b, chosen] = True
+
+        sample_mask = pos_mask | selected_neg  # [B, A]
+
+        # normalize by number of sampled anchors (pos + selected neg)
+        denom = sample_mask.sum().clamp(min=1).to(loss_per_anchor.dtype)
+        loss_cls = (loss_per_anchor * sample_mask).sum() / denom
 
         return loss_cls, instance_data_list
 
@@ -285,7 +326,7 @@ class CondInst3dPRL(pl.LightningModule):
             outputs: Dict[str, Tensor],
             targets,
             instance_list: "InstanceList",
-    ) -> Tensor:
+    ) -> Dict[str, Tensor]:
         """
         Computes instance segmentation loss.
 
@@ -297,20 +338,28 @@ class CondInst3dPRL(pl.LightningModule):
         """
 
         instance_logits = outputs["instance_logits"]
+        semantic_logits = outputs["semantic_logits"]
+        semantic_gt_mask = torch.stack([t["semantic_mask"] for t in targets], dim=0)
         stride = getattr(self.instance_segmentation_head, "stride", 1)
 
         # upsample if needed (supports int or tuple stride)
         needs_upsample = (stride > 1) if isinstance(stride, int) else any(s > 1 for s in stride)
         if needs_upsample:
             instance_logits = aligned_trilinear(instance_logits, stride)
+            semantic_logits = aligned_trilinear(semantic_logits, stride)
 
+        semantic_loss = self.losses["semantic_segmentation"](semantic_logits, semantic_gt_mask)
         n_insts = len(instance_list)
         if n_insts == 0:
-            return instance_logits.sum() * 0.0
+            instance_loss = instance_logits.sum() * 0.0
+        else:
+            gt_masks = instance_list.get_gt_mask(targets, dtype=instance_logits.dtype)
+            instance_loss = self.losses["instance_segmentation"](instance_logits, gt_masks)
 
-        gt_masks = instance_list.get_gt_mask(targets, dtype=instance_logits.dtype)
-        loss = self.losses["segmentation"](instance_logits, gt_masks)
-        return loss
+        return {
+            "instance_segmentation": instance_loss,
+            "semantic_segmentation": semantic_loss,
+        }
 
     def compute_loss(self, outputs, targets):
         classification_loss, instance_data_list = self._compute_detection_loss(outputs, targets)
@@ -323,7 +372,7 @@ class CondInst3dPRL(pl.LightningModule):
             instance_list,
         )
 
-        instance_segmentation_loss = self._compute_segmentation_loss(
+        segmentation_losses = self._compute_segmentation_loss(
             outputs=outputs,
             targets=targets,
             instance_list=instance_list,
@@ -331,7 +380,8 @@ class CondInst3dPRL(pl.LightningModule):
 
         return {
             "classification": classification_loss,
-            "instance_segmentation": instance_segmentation_loss,
+            "instance_segmentation": segmentation_losses["instance_segmentation"],
+            "semantic_segmentation": segmentation_losses["semantic_segmentation"],
         }
 
     # ---------------- Inference: detections + seg ----------------
@@ -393,9 +443,8 @@ class CondInst3dPRL(pl.LightningModule):
                 logits_l = logits_l[i]  # [A_l, C]
                 A_l, C = logits_l.shape
 
-                # score definition (matches your code): sqrt(sigmoid)
                 # flatten so each anchor-class pair is a candidate
-                scores = torch.sigmoid(logits_l).sqrt().reshape(-1)  # [A_l*C]
+                scores = torch.sigmoid(logits_l).reshape(-1)  # [A_l*C]
 
                 keep = scores > score_thresh
                 if not torch.any(keep):
@@ -407,7 +456,7 @@ class CondInst3dPRL(pl.LightningModule):
                 # top-k per level
                 k = min(topk_candidates, keep_idx.numel())
                 if k < keep_idx.numel():
-                    keep_scores, order = torch.topk(keep_scores, k, largest=True, sorted=False)
+                    keep_scores, order = torch.topk(keep_scores, k, largest=True)
                     keep_idx = keep_idx[order]
 
                 # decode (anchor_idx, class_idx) from flattened index
@@ -477,7 +526,7 @@ class CondInst3dPRL(pl.LightningModule):
         Expected inputs: [B, P, Ch, ph, pw, pd]
         """
         # output_shape = inputs.meta["dim"][1:4]
-        output_shape = np.array([192, 240, 72])
+        output_shape = self.trainer.datamodule.roi_size
         batch_size, n_patches = inputs.shape[:2]
 
         # Flatten patches -> [B*P, Ch, ph, pw, pd]
@@ -512,7 +561,6 @@ class CondInst3dPRL(pl.LightningModule):
 
         mask_thresh = float(self.inference_hyperparams["mask_thresh"])
         nms_thresh = float(self.inference_hyperparams["nms_thresh"])
-        group_thresh = float(self.inference_hyperparams["group_thresh"])
 
         detseg_per_patch: List[Dict[str, Tensor]] = []
         for i, det in enumerate(detections):
@@ -565,8 +613,7 @@ class CondInst3dPRL(pl.LightningModule):
             per_image[b]["bboxes"].append(out["bboxes"])
             per_image[b]["offset"].append(out["offset"])
 
-        detseg_per_image = [aggregate_per_patch_detections(x, group_thresh, mask_thresh) for x in per_image]
-        return detseg_per_image
+        return per_image
 
     @torch.no_grad()
     def postprocess(self, detections_and_segmentations: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
@@ -641,22 +688,19 @@ class CondInst3dPRL(pl.LightningModule):
         return out
 
     # ---------------- Forward ----------------
-    def forward(self, inputs) -> Any:
+    def forward(self, inputs: MetaTensor) -> Any:
         # using chunks to reduce GPU memory usage
         chunk_size = int(self.forward_chunk_size)
         b_size = inputs.shape[0]
         shape = inputs.shape
         device = inputs.device
         offsets = None
+        input_meta = inputs.meta
+        spacing = input_meta["pixdim"][1:4]
+        inputs = inputs.as_tensor()
 
-        is_meta_tensor = isinstance(inputs, MetaTensor)
-        if is_meta_tensor:
-            input_meta = inputs.meta
-            inputs = inputs.as_tensor()
-            if "location" in input_meta:
-                offsets = input_meta["location"]
-            else:
-                offsets = input_meta["crop_center"]
+        if "location" in input_meta:
+            offsets = input_meta["location"]
             if isinstance(offsets, (list, tuple, np.ndarray)):
                 offsets = torch.as_tensor(offsets, device=inputs.device)
             if offsets.ndim == 2 and offsets.shape[0] == 3:
@@ -670,18 +714,20 @@ class CondInst3dPRL(pl.LightningModule):
             f_mask, head_features = self.backbone(input_chunk)
             cls_logits = self.classification_head(head_features)
             controller_logits = self.controller_head(head_features)
+            semantic_logits = self.semantic_head(f_mask)
 
             chunked_outputs.append({
                 "cls_logits": cls_logits,
                 "controller_logits": controller_logits,
                 "f_mask": f_mask,
                 "features": head_features,
+                "semantic_logits": semantic_logits,
             })
 
         f_mask = torch.cat([c["f_mask"] for c in chunked_outputs], dim=0)
-
-        if is_meta_tensor:
-            f_mask = MetaTensor(f_mask, meta=input_meta)
+        semantic_logits = torch.cat([c["semantic_logits"] for c in chunked_outputs], dim=0)
+        f_mask = MetaTensor(f_mask, meta=input_meta)
+        semantic_logits = MetaTensor(semantic_logits, meta=input_meta)
 
         outputs = {
             "cls_logits": torch.cat([c["cls_logits"] for c in chunked_outputs], dim=0),
@@ -691,8 +737,10 @@ class CondInst3dPRL(pl.LightningModule):
                 torch.cat([c["features"][j] for c in chunked_outputs], dim=0)
                 for j in range(len(self.anchors_sizes))
             ],
+            "semantic_logits": semantic_logits,
             "offsets": offsets,
             "shape": shape,
+            "spacing": spacing,
             "device": device,
         }
         return outputs
@@ -944,8 +992,14 @@ class CondInst3dPRL(pl.LightningModule):
     def predict_step(self, batch: dict, batch_idx, dataloader_idx=0) -> Any:
         inputs = batch["inputs"]
         det = self.compute_detections_and_segmentations(inputs)
+
+        # group instances in overlapping area
+        mask_thresh = float(self.inference_hyperparams["mask_thresh"])
+        group_thresh = float(self.inference_hyperparams["group_thresh"])
+        detseg_per_image = [aggregate_per_patch_detections(x, group_thresh, mask_thresh) for x in det]
+
         # det = self.postprocess(det)
-        return det
+        return detseg_per_image
 
     # ---------------- Optimizers ----------------
     def configure_optimizers(self) -> OptimizerLRScheduler:
