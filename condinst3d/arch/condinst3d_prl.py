@@ -29,7 +29,7 @@ from condinst3d.utils.bached_ag import batched_nms, aggregate_per_patch_detectio
 from condinst3d.visualization.utils import get_stats
 from condinst3d.visualization.list_instance_boxseg_visualizer import ListInstanceBoxSegSliceVisualizer
 from condinst3d.evaluator.metrics.cfm_based import compute_precision, compute_fi, compute_recall
-from monai.transforms import Lambda
+from monai.transforms import KeepLargestConnectedComponent, RemoveSmallObjects, Compose
 
 
 # ---------------- Metric logging helpers ----------------
@@ -98,7 +98,7 @@ class CondInst3dPRL(pl.LightningModule):
             num_params=self.instance_segmentation_head.num_params
         )
         self.semantic_head = nn.Sequential(
-            nn.GroupNorm(num_groups=min(4, self.backbone.out_channels), num_channels=self.backbone.out_channels),
+            nn.InstanceNorm3d(self.backbone.out_channels),
             nn.LeakyReLU(),
             nn.Conv3d(self.backbone.out_channels, cfg.heads.classification.num_classes + 1, kernel_size=3, padding='same')
         )
@@ -111,10 +111,10 @@ class CondInst3dPRL(pl.LightningModule):
         }
 
         # -------------------- postproc params --------------------
-        postproc_transforms = [Lambda(func=lambda x: x)]
-        if "postproc" in cfg and cfg.postproc is not None:
-            postproc_transforms += [instantiate(t) for t in cfg.postproc.transforms]
-        self.postproc_transform = Compose(postproc_transforms)
+        self.postproc_transform = Compose([
+            RemoveSmallObjects(min_size=8, connectivity=None),
+            KeepLargestConnectedComponent(independent=True, is_onehot=True, num_components=1)
+        ])
 
         # -------------------- inference/matching hyperparams --------------------
         self.inference_hyperparams = cfg.inference
@@ -133,7 +133,7 @@ class CondInst3dPRL(pl.LightningModule):
             draw_boxes=False,
             show_slices=cfg.visualization.show_slices,
             figsize=cfg.visualization.figsize,
-            img_channels=img_channels,
+            img_channels=img_channels + ["semantic_mask"],
             channel_seg_under_image=cfg.visualization.channel_seg_under_image,
         )
         self.images_to_visualize: Dict[int, List[int]] = {}
@@ -613,76 +613,37 @@ class CondInst3dPRL(pl.LightningModule):
         return per_image
 
     @torch.no_grad()
-    def postprocess(self, detections_and_segmentations: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
+    def postprocess(self, det_and_seg: List[Dict[str, List[Tensor]]]) -> List[Dict[str, List[Tensor]]]:
         mask_thresh = float(self.inference_hyperparams.get("mask_thresh", 0.5))
-        nms_thresh = float(self.inference_hyperparams.get("nms_thresh", 0.1))
+        output = []
+        for per_img_det_and_seg in det_and_seg:
+            per_img_output = {"anchor_centers": [], "anchor_strides": [], "classes": [], "scores": [], "offset": [],
+                              "onehot_logits": [], "bboxes": []}
+            onehot_mask_per_patch = per_img_det_and_seg["onehot_logits"]
+            for i in range(len(onehot_mask_per_patch)):
+                # 1) binarize + postproc
+                onehot = onehot_mask_per_patch[i].squeeze(1) >= mask_thresh
+                K = onehot.shape[0]
+                if K > 0:
+                    onehot_pp = self.postproc_transform(onehot)
 
-        out = []
-        for per_img in detections_and_segmentations:
-            onehot_probs = per_img["onehot_probs"]  # [K,1,H,W,D]
-            scores = per_img["scores"]  # [K]
-            K = int(onehot_probs.shape[0])
+                    # 2) remove empty instances
+                    keep = onehot_pp.flatten(1).any(dim=1) # [K]
+                    keep_idx = torch.where(keep)[0]
 
-            if K == 0:
-                # ensure expected keys exist
-                H, W, D = onehot_probs.shape[-3:]
-                per_img["bboxes"] = onehot_probs.new_zeros((0, 6), dtype=torch.float32)
-                per_img["onehot_instance_mask"] = onehot_probs.new_zeros((0, 1, H, W, D), dtype=torch.bool)
-                per_img["instance_mask"] = onehot_probs.new_zeros((H, W, D), dtype=torch.long)
-                out.append(per_img)
-                continue
+                    for key in ["anchor_centers", "anchor_strides", "classes", "scores", "offset"]:
+                        per_img_output[key].append(per_img_det_and_seg[key][i][keep_idx])
 
-            # 1) binarize + postproc
-            onehot = (onehot_probs >= mask_thresh)
-            onehot = self.postproc_transform(onehot)
+                    logits_pp = (per_img_det_and_seg["onehot_logits"][i] * onehot_pp)[keep_idx]
+                    bboxes_pp = get_onehot_instance_mask_boxes(logits_pp)
+                    per_img_output["onehot_logits"].append(logits_pp)
+                    per_img_output["bboxes"].append(bboxes_pp)
+                else:
+                    for key in ["anchor_centers", "anchor_strides", "classes", "scores", "offset", "onehot_logits", "bboxes"]:
+                        per_img_output[key].append(per_img_det_and_seg[key][i])
 
-            # 2) remove empty instances
-            keep = torch.any(onehot, dim=(1, 2, 3, 4))  # [K]
-            keep_idx = torch.where(keep)[0]
-
-            if keep_idx.numel() == 0:
-                H, W, D = onehot.shape[-3:]
-                empty = keep_idx  # [0]
-                per_img = {k: v[empty] for k, v in per_img.items()}
-                per_img["onehot_instance_mask"] = onehot[empty]
-                per_img["bboxes"] = onehot.new_zeros((0, 6), dtype=torch.float32)
-                per_img["instance_mask"] = onehot.new_zeros((H, W, D), dtype=torch.long)
-                out.append(per_img)
-                continue
-
-            per_img = {k: v[keep_idx] for k, v in per_img.items()}
-            onehot = onehot[keep_idx]
-            scores = per_img["scores"]
-
-            # 3) boxes for NMS (IoU on boxes)
-            bboxes = get_onehot_instance_mask_boxes(onehot)  # must return [K',6]
-            per_img["bboxes"] = bboxes
-
-            # 4) NMS
-            if onehot.shape[0] > 1:
-                keep_nms = batched_nms(bboxes, scores, threshold=nms_thresh, metric="iou")
-                keep_nms = torch.as_tensor(keep_nms, device=onehot.device, dtype=torch.long)
-
-                per_img = {k: v[keep_nms] for k, v in per_img.items()}
-                onehot = onehot[keep_nms]
-                scores = per_img["scores"]
-
-            # 5) mutually exclusive instance mask + onehot
-            instance_mask = priority_based_onehot_to_instance_mask(onehot, scores)
-            # 6) Extract unique instance labels
-            remained_instances = list(get_unique_labels(instance_mask, is_onehot=False, discard=0))
-            remained_instances = [x - 1 for x in remained_instances]  # undo the effect of background class
-            per_img = {k: v[remained_instances] for k, v in per_img.items()}
-
-            instance_mask = relabel_sequential(instance_mask, exclude_background=True)
-            mutually_exclusive_onehot = instance_mask_to_onehot(instance_mask)
-
-            per_img["onehot_instance_mask"] = mutually_exclusive_onehot
-            per_img["instance_mask"] = instance_mask
-
-            out.append(per_img)
-
-        return out
+            output.append(per_img_output)
+        return output
 
     # ---------------- Forward ----------------
     def forward(self, inputs: MetaTensor) -> Any:
@@ -824,6 +785,9 @@ class CondInst3dPRL(pl.LightningModule):
             return preds
 
         for i, (det, tgt) in enumerate(zip(preds, targets)):
+            semantic_gt = tgt["semantic_mask"]
+            img_to_show = torch.cat([inputs_full[i], semantic_gt], dim=0)
+
             scores = det["scores"]
 
             gt_onehot = _squeeze_onehot(tgt["onehot"])
@@ -843,7 +807,7 @@ class CondInst3dPRL(pl.LightningModule):
             title = str(cases[i]) if cases is not None else f"idx={i}"
 
             figs = self.instance_head_visualizer.plot(
-                inputs=inputs_full[i],
+                inputs=img_to_show,
                 y_pred=y_pred,
                 y_true=y_true,
                 stats=[stats],
@@ -990,13 +954,13 @@ class CondInst3dPRL(pl.LightningModule):
         inputs = batch["inputs"]
         output_shape = batch["inputs_orig"].shape[-3:]
         det = self.compute_detections_and_segmentations(inputs)
+        # det = self.postprocess(det)
 
         # group instances in overlapping area
         mask_thresh = float(self.inference_hyperparams["mask_thresh"])
         group_thresh = float(self.inference_hyperparams["group_thresh"])
         detseg_per_image = [aggregate_per_patch_detections(x, group_thresh, mask_thresh, output_shape) for x in det]
 
-        # det = self.postprocess(det)
         return detseg_per_image
 
     # ---------------- Optimizers ----------------
