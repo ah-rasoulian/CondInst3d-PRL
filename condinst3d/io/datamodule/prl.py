@@ -1,8 +1,8 @@
-from typing import Any, Literal
+from typing import Any
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 import torch
-from monai.data import PersistentDataset, Dataset, GDSDataset
+from monai.data import Dataset
 from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
 from omegaconf import DictConfig, OmegaConf
 import pickle
@@ -10,14 +10,14 @@ import json
 import os
 from monai.transforms import (
     Compose,
-    LoadImaged, Lambdad, EnsureChannelFirstd, EnsureTyped, ConcatItemsd, DeleteItemsd,
-    Orientationd, NormalizeIntensityd, CenterSpatialCropd,
-    RandCropByLabelClassesd, RandSpatialCropd, SpatialPadd, GridPatchd,
+    LoadImaged, Lambdad, EnsureChannelFirstd, EnsureTyped, ConcatItemsd, DeleteItemsd, CropForegroundd,
+    RandWeightedCropd, RandSpatialCropd, GridPatchd, ApplyPendingd,
     RandRotated, RandZoomd, RandFlipd, OneOf, RandRicianNoised, RandGaussianNoised,
     RandScaleIntensityd, RandShiftIntensityd, RandAdjustContrastd, RandGaussianSharpend, CopyItemsd,
 )
 import numpy as np
-from condinst3d.io.transforms import LoadJSONd, InstanceMaskToOneHotd, OneHotToBoxesd
+from condinst3d.io.transforms import (MaskedPercentileNormalizeIntensityd, InstanceMaskToDetd,
+                                      MakeBalancedInstanceWeightMapd, SpatialPadWithMind, SymmetricGridPadWithMind)
 from condinst3d.io.collate import multi_instance_collate
 from condinst3d.io.sampler import DistributedWeightedSampler
 from functools import partial
@@ -30,7 +30,10 @@ def build_cases(cases, modalities, image_directory, label_directory):
         for i, m in enumerate(modalities):
             case_dict[m] = os.path.join(image_directory, f"{case}_{i:04d}.nii.gz")
         case_dict['instance_mask'] = os.path.join(label_directory, f"{case}.nii.gz")
-        case_dict['info'] = os.path.join(label_directory, f"{case}.json")
+        case_dict['brain_mask'] = os.path.join(image_directory, f"{case}_brainmask.nii.gz")
+        with open(os.path.join(label_directory, f"{case}.json"), "r") as f:
+            info = json.load(f)
+        case_dict["info"] = info
         df_list.append(case_dict)
     return df_list
 
@@ -61,28 +64,31 @@ class PRLDataModule(pl.LightningDataModule):
         self.modalities = modalities
         self.num_workers = cfg.num_workers
         self.batch_size = cfg.batch_size
+        self.roi_size = cfg.roi_size
         self.patch_size = cfg.patch_size
         self.patches_per_subject = cfg.patches_per_subject
         self.patch_overlap = cfg.patch_overlap
         self.augmentation_prob = cfg.augmentation_prob
         self.collate_fn = partial(
             multi_instance_collate,
-            collate_keys=['inputs', 'inputs_orig', 'instance_mask', 'boxes', 'classes', 'onehot'],
-            target_keys={"targets": {"boxes": "boxes", "classes": "classes", "onehot": "onehot"}}
+            collate_keys=['inputs', 'inputs_orig', 'instance_mask', 'semantic_mask', 'boxes', 'classes', 'onehot'],
+            target_keys={"targets":
+                             {"boxes": "boxes",
+                              "classes": "classes",
+                              "onehot": "onehot",
+                              "semantic_mask": "semantic_mask"}
+                         }
         )
         self.datasets = {}
 
         # --- compute instance counts & sampling weights for train cases ---
         train_counts = []
         for item in train_df:
-            with open(item["info"], "r") as f:
-                info = json.load(f)
-
-            # your format: {"instances": {0:0, 1:0, ...}} → number of instances = number of keys
-            n_inst = len(info.get("instances", {}).keys())
+            # info format: {"instances": {0:0, 1:0, ...}} → number of instances = number of keys
+            n_inst = len(item["info"].get("instances", {}).keys())
             train_counts.append(n_inst)
 
-        # weight design (simple + works well):
+        # weight design:
         # - keep some probability for N=0 (so model learns true negatives)
         # - oversample larger-N cases smoothly
         empty_weight = getattr(cfg, "empty_case_weight", 0.2)  # keep negatives but not too often
@@ -99,53 +105,71 @@ class PRLDataModule(pl.LightningDataModule):
 
     def _get_load_transforms(self):
         return [
-            # load .nii/.nii.gz images and .json info
+            # load .nii/.nii.gz images
             LoadImaged(keys=self.modalities),
-            LoadImaged(keys=['instance_mask'], dtype=torch.int16),
-            LoadJSONd(keys=['info']),
+            LoadImaged(keys=['instance_mask'], dtype=torch.int32),
+            LoadImaged(keys=['brain_mask'], dtype=torch.uint8),
 
             # make each modality channel-first: [C=1, H, W, D]
-            EnsureChannelFirstd(keys=self.modalities + ["instance_mask"]),
-            # make orientation consistent
-            Orientationd(keys=self.modalities + ["instance_mask"], axcodes="RAS", labels=None),
-            # concat modalities -> "inputs" with shape [C, H, W, D]
+            EnsureChannelFirstd(keys=self.modalities + ["instance_mask", "brain_mask"]),
+
+            # add semantic mask
+            CopyItemsd(keys=['instance_mask'], times=1, names=['semantic_mask']),
+            Lambdad(keys=['semantic_mask'], func=lambda m: m > 0),
+
+            # crop with the brain mask
+            CropForegroundd(
+                keys=self.modalities + ["instance_mask", "semantic_mask", "brain_mask"],
+                source_key="brain_mask",
+                allow_smaller=True,
+                margin=4,
+            ),
+
+            # concat modalities -> "inputs" with shape [C, H, W, D] and delete individual mods
             ConcatItemsd(keys=self.modalities, name="inputs", dim=0),
-            # delete individual mods
             DeleteItemsd(keys=self.modalities),
-            # center cropping background
-            CenterSpatialCropd(keys=["inputs", "instance_mask"], roi_size=(192, 240, 72)),
+
+            # normalize input intensities
+            MaskedPercentileNormalizeIntensityd(
+                keys=["inputs"],
+                mask_key="brain_mask",
+                percentiles=(0.5, 99.5),
+                channel_wise=True,
+                z_clamp=(-6.0, 6.0),
+            ),
+
             # make torch tensors + meta, put on correct dtype
             EnsureTyped(keys=["inputs"], dtype=torch.float32, track_meta=True),
-            EnsureTyped(keys=["instance_mask"], dtype=torch.int16, track_meta=False),
-            # normalize modality intensities
-            NormalizeIntensityd(keys=["inputs"], channel_wise=True),
+            EnsureTyped(keys=["instance_mask", "semantic_mask"], dtype=torch.int32, track_meta=False),
         ]
 
     def _get_augmentation_transorms(self):
         return [
             # spatial augmentation
             RandRotated(
-                keys=['inputs', 'instance_mask'],
+                keys=['inputs', 'instance_mask', 'semantic_mask'],
                 range_x=np.pi / 4, range_y=np.pi / 4, range_z=np.pi / 4,
                 prob=self.augmentation_prob,
                 keep_size=False,
-                mode=["bilinear", "nearest"],
+                mode=["bilinear", "nearest", "nearest"],
                 lazy=True,
             ),
             RandZoomd(
-                keys=['inputs', 'instance_mask'],
+                keys=['inputs', 'instance_mask', 'semantic_mask'],
                 prob=self.augmentation_prob,
                 min_zoom=0.75, max_zoom=1.25,
-                mode=["area", "nearest-exact"],
+                mode=["trilinear", "nearest-exact", "nearest-exact"],
                 keep_size=False,
                 lazy=True,
             ),
             RandFlipd(
-                keys=['inputs', 'instance_mask'],
+                keys=['inputs', 'instance_mask', 'semantic_mask'],
                 prob=self.augmentation_prob,
                 spatial_axis=[0, 1, 2],
                 lazy=True,
             ),
+            ApplyPendingd(keys=["inputs", "instance_mask", "semantic_mask"]),
+
             # intensity augmentation
             RandScaleIntensityd(
                 keys=['inputs'],
@@ -179,61 +203,64 @@ class PRLDataModule(pl.LightningDataModule):
                     std=0.01,
                 )
             ]),
-
         ]
 
     def _get_center_patches_transforms(self):
         return [
-            RandCropByLabelClassesd(
-                keys=["inputs", "instance_mask"],
-                label_key="instance_mask",
-                image_key="inputs",
-                image_threshold=0.1,
+            # build balanced weight map from instance ids (recommended)
+            MakeBalancedInstanceWeightMapd(instance_key="instance_mask", out_key="inst_wmap"),
+
+            RandWeightedCropd(
+                keys=["inputs", "instance_mask", "semantic_mask"],
+                w_key="inst_wmap",
                 spatial_size=np.array(self.patch_size) * 1.5,
-                num_classes=64,
                 num_samples=self.patches_per_subject,
-                allow_smaller=True,
-                warn=False,
                 lazy=True,
             ),
+
             RandSpatialCropd(
-                keys=['inputs', 'instance_mask'],
+                keys=["inputs", "instance_mask", "semantic_mask"],
                 roi_size=self.patch_size,
                 random_center=True,
                 lazy=True,
             ),
-            SpatialPadd(
-                keys=['inputs', 'instance_mask'],
+
+            # pad inputs with background-like value in normalized space; masks with 0
+            SpatialPadWithMind(
+                keys=["inputs", "instance_mask", "semantic_mask"],
+                mask_keys=["instance_mask", "semantic_mask"],
                 spatial_size=self.patch_size,
-                mode='constant',
-                lazy=True,
-            )
+            ),
+
+            ApplyPendingd(keys=["inputs", "instance_mask", "semantic_mask"]),
         ]
 
     def _get_grid_patches_transforms(self):
         return [
-            CopyItemsd(keys=['inputs'], times=1, names=['inputs_orig']),
+            CopyItemsd(keys=["inputs"], times=1, names=["inputs_orig"]),
 
-            GridPatchd(
-                keys=['inputs'],
+            # Symmetric, min-value padding so first/last patches are equally affected
+            SymmetricGridPadWithMind(
+                keys=["inputs"],
                 patch_size=self.patch_size,
                 overlap=self.patch_overlap,
-                pad_mode='constant'
+            ),
+
+            GridPatchd(
+                keys=["inputs"],
+                patch_size=self.patch_size,
+                overlap=self.patch_overlap,
+                pad_mode=None,  # preferred: no extra padding needed now
             ),
         ]
 
     def _get_det_transforms(self):
         return [
-            # create a onehot mask for instance mask
-            InstanceMaskToOneHotd(keys=['instance_mask'], out_key='onehot', include_background=False),
-            # create boxes and class tensors
-            OneHotToBoxesd(
-                onehot_key="onehot",
-                boxes_key="boxes",
-                classes_key="classes",
+            # create boxes, class and onehot tensors
+            InstanceMaskToDetd(
+                instance_key="instance_mask",
                 default_class=0,
-                max_instances=-1,
-            ),
+            )
         ]
 
     def setup(self, stage):
