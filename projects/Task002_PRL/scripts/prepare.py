@@ -1,8 +1,10 @@
+from __future__ import annotations
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import shutil
 import os
 import sys
 from pathlib import Path
-
+import subprocess
 import numpy as np
 import pandas as pd
 from loguru import logger
@@ -176,10 +178,104 @@ def split_data():
                       shuffle=True,
                       )
 
+def _run_extract_one_case(case_t1: str, out_mask: str, sif: str, bind_args: list[str]) -> tuple[str, bool, str]:
+    """
+    Runs synthstrip for one file. Returns (case_t1, ok, message).
+    """
+    case_t1_p = Path(case_t1)
+    out_mask_p = Path(out_mask)
+
+    if out_mask_p.exists():
+        return (case_t1, True, "skipped")
+
+    cmd = [
+        "singularity", "exec",
+        *bind_args,
+        sif,
+        "mri_synthstrip",
+        "-i", str(case_t1_p),
+        "-m", str(out_mask_p),
+        "--no-csf",
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return (case_t1, True, "ok")
+    except subprocess.CalledProcessError as e:
+        msg = (
+            f"Command: {' '.join(cmd)}\n"
+            f"STDOUT:\n{e.stdout}\n\n"
+            f"STDERR:\n{e.stderr}\n"
+        )
+        return (case_t1, False, msg)
+
+
+def brain_extract(num_workers: int = 8, fail_fast: bool = False) -> None:
+    det_data_dir = Path(os.getenv("det_data"))
+    task_data_dir = det_data_dir / "Task100_PRL"
+    splitted_dir = task_data_dir / "raw_splitted"
+
+    images_tr = splitted_dir / "imagesTr"
+    images_ts = splitted_dir / "imagesTs"
+
+    sif = Path(os.getenv("FREESURFER_SIF", str(Path.home() / "containers" / "freesurfer_7.4.1.sif")))
+    if not sif.exists():
+        raise FileNotFoundError(
+            f"FreeSurfer SIF not found: {sif}\n"
+            f"Set FREESURFER_SIF or place it at ~/containers/freesurfer_7.4.1.sif"
+        )
+
+    bind_roots = ["/scratch", "/trials", str(Path.home())]
+    bind_args: list[str] = []
+    for b in bind_roots:
+        if Path(b).exists():
+            bind_args += ["-B", f"{b}:{b}"]
+
+    # Collect jobs
+    jobs: list[tuple[str, str]] = []
+    for data_dir in [images_tr, images_ts]:
+        if not data_dir.exists():
+            continue
+        for case_t1 in sorted(data_dir.glob("*_0000.nii.gz")):
+            case_name = case_t1.name.removesuffix("_0000.nii.gz")
+            out_mask = data_dir / f"{case_name}_brainmask.nii.gz"
+            if out_mask.exists():
+                continue
+            jobs.append((str(case_t1), str(out_mask)))
+
+    if not jobs:
+        print("No missing masks found. Nothing to do.")
+        return
+
+    print(f"Running SynthStrip on {len(jobs)} cases with {num_workers} workers...")
+
+    errors: list[str] = []
+    with ProcessPoolExecutor(max_workers=num_workers) as ex:
+        futs = [
+            ex.submit(_run_extract_one_case, case_t1, out_mask, str(sif), bind_args)
+            for case_t1, out_mask in jobs
+        ]
+
+        for fut in tqdm(as_completed(futs), total=len(futs)):
+            case_t1, ok, msg = fut.result()
+            if not ok:
+                errors.append(f"FAILED: {case_t1}\n{msg}")
+                if fail_fast:
+                    raise RuntimeError(errors[-1])
+
+    if errors:
+        # Write a log so you can re-run only failures
+        log_path = splitted_dir / "synthstrip_failures.log"
+        log_path.write_text("\n\n" + ("\n" + "-" * 80 + "\n").join(errors))
+        raise RuntimeError(f"{len(errors)} SynthStrip jobs failed. See: {log_path}")
+
+    print("All SynthStrip jobs completed successfully.")
+
 
 if __name__ == '__main__':
     from fire import Fire
     Fire({
         "convert2nifty": convert_to_nifty,
         "split_data": split_data,
+        "brain_extract": brain_extract()
     })
