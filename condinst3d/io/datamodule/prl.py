@@ -64,7 +64,6 @@ class PRLDataModule(pl.LightningDataModule):
         self.modalities = modalities
         self.num_workers = cfg.num_workers
         self.batch_size = cfg.batch_size
-        self.roi_size = cfg.roi_size
         self.patch_size = cfg.patch_size
         self.patches_per_subject = cfg.patches_per_subject
         self.patch_overlap = cfg.patch_overlap

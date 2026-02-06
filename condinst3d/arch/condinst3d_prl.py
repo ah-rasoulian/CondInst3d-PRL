@@ -525,8 +525,6 @@ class CondInst3dPRL(pl.LightningModule):
 
         Expected inputs: [B, P, Ch, ph, pw, pd]
         """
-        # output_shape = inputs.meta["dim"][1:4]
-        output_shape = self.trainer.datamodule.roi_size
         batch_size, n_patches = inputs.shape[:2]
 
         # Flatten patches -> [B*P, Ch, ph, pw, pd]
@@ -591,7 +589,6 @@ class CondInst3dPRL(pl.LightningModule):
         per_image: List[Dict[str, List[Tensor]]] = []
         for b in range(batch_size):
             per_image.append({
-                "output_shape": output_shape,
                 "anchor_centers": [],
                 "anchor_strides": [],
                 "classes": [],
@@ -991,12 +988,13 @@ class CondInst3dPRL(pl.LightningModule):
 
     def predict_step(self, batch: dict, batch_idx, dataloader_idx=0) -> Any:
         inputs = batch["inputs"]
+        output_shape = batch["inputs_orig"].shape[-3:]
         det = self.compute_detections_and_segmentations(inputs)
 
         # group instances in overlapping area
         mask_thresh = float(self.inference_hyperparams["mask_thresh"])
         group_thresh = float(self.inference_hyperparams["group_thresh"])
-        detseg_per_image = [aggregate_per_patch_detections(x, group_thresh, mask_thresh) for x in det]
+        detseg_per_image = [aggregate_per_patch_detections(x, group_thresh, mask_thresh, output_shape) for x in det]
 
         # det = self.postprocess(det)
         return detseg_per_image

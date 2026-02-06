@@ -82,17 +82,17 @@ model:
   losses:
     neg_pos_ratio: 4
     max_neg_per_image: 5000
-    min_neg_when_no_pos: 50
+    min_neg_when_no_pos: 100
 
     classification:
       _target_: condinst3d.losses.focal.FocalLoss
-      alpha: 0.6
+      alpha: 0.8
       gamma: 2.0
       reduction: none
 
     instance_segmentation:
       _target_: condinst3d.losses.dice_focal.DiceFocalLoss
-      alpha: 0.5
+      alpha: 0.8
       gamma: 2.0
       reduction: "mean"
 
@@ -102,7 +102,7 @@ model:
       softmax: true
       reduction: "mean"
       to_onehot_y: True
-      alpha: 0.5
+      alpha: 0.8
       gamma: 2.0
 
   postproc:
@@ -162,7 +162,6 @@ data:
   empty_case_weight: 0.2
   instance_weight_power: 0.7
 
-  roi_size: [192, 240, 72]
   patch_size: [96, 96, 48]
   patches_per_subject: 4
   patch_overlap: 0.25
