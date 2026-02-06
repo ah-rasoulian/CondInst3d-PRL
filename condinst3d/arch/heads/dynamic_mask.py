@@ -136,7 +136,7 @@ class DynamicMaskHead(nn.Module):
         soi = inst_strides * float(self.size_of_interest)      # [M, 3]
 
         # output prealloc
-        out = f_mask.new_zeros((n_inst, 1, W, H, D))
+        out = []
 
         # batch processing to limit grouped conv size
         max_bs = min(self.max_batch_size, n_inst)
@@ -160,12 +160,12 @@ class DynamicMaskHead(nn.Module):
             feat = f_mask[im_inds[start:end]]               # [bs, C, W, H, D]
 
             # concat coords + features and pack into grouped-conv format
-            mask_in = torch.cat([rel, feat], dim=1)         # [bs, C+3, W, H, D]
+            mask_in = torch.cat([feat, rel], dim=1)         # [bs, C+3, W, H, D]
             mask_in = mask_in.view(1, -1, W, H, D)          # [1, bs*(C+3), W, H, D]
 
             weights, biases = self.parse_dynamic_params(mask_head_params[start:end])
             mask_logits = self.mask_heads_forward(mask_in, weights, biases, bs)  # [1, bs, W, H, D] (grouped)
 
-            out[start:end] = mask_logits.view(bs, 1, W, H, D)
+            out.append(mask_logits.view(bs, 1, W, H, D))
 
-        return out
+        return torch.cat(out, dim=0)
