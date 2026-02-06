@@ -104,5 +104,5 @@ class MakeBalancedInstanceWeightMapd(MapTransform):
             if float(w.sum().item()) < self.eps:
                 w = (inst > 0).to(torch.float32)
 
-        d[self.out_key] = w
+        d[self.out_key] = w.unsqueeze(0)
         return d

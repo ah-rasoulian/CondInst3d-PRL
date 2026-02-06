@@ -125,9 +125,8 @@ class PRLDataModule(pl.LightningDataModule):
                 margin=4,
             ),
 
-            # concat modalities -> "inputs" with shape [C, H, W, D] and delete individual mods
+            # concat modalities -> "inputs" with shape [C, H, W, D]
             ConcatItemsd(keys=self.modalities, name="inputs", dim=0),
-            DeleteItemsd(keys=self.modalities),
 
             # normalize input intensities
             MaskedPercentileNormalizeIntensityd(
@@ -137,6 +136,9 @@ class PRLDataModule(pl.LightningDataModule):
                 channel_wise=True,
                 z_clamp=(-6.0, 6.0),
             ),
+
+            # delete individual mods and brain_mask
+            DeleteItemsd(keys=self.modalities + ["brain_mask"]),
 
             # make torch tensors + meta, put on correct dtype
             EnsureTyped(keys=["inputs"], dtype=torch.float32, track_meta=True),
@@ -241,7 +243,8 @@ class PRLDataModule(pl.LightningDataModule):
 
             # Symmetric, min-value padding so first/last patches are equally affected
             SymmetricGridPadWithMind(
-                keys=["inputs"],
+                keys=["inputs", "inputs_orig", "instance_mask", "semantic_mask"],
+                mask_keys=["instance_mask", "semantic_mask"],
                 patch_size=self.patch_size,
                 overlap=self.patch_overlap,
             ),
