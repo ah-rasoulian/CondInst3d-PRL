@@ -139,7 +139,6 @@ class SymmetricGridPadWithMind(MapTransform):
                 x = torch.as_tensor(x)
 
             X, Y, Z = map(int, x.shape[-3:])  # (X,Y,Z)
-            print(X, Y, Z)
             px = self._pad_needed(X, self.patch_size[0], self.stride[0])
             py = self._pad_needed(Y, self.patch_size[1], self.stride[1])
             pz = self._pad_needed(Z, self.patch_size[2], self.stride[2])
