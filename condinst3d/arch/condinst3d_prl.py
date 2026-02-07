@@ -98,9 +98,8 @@ class CondInst3dPRL(pl.LightningModule):
             num_params=self.instance_segmentation_head.num_params
         )
         self.semantic_head = nn.Sequential(
-            nn.InstanceNorm3d(self.backbone.out_channels),
-            nn.LeakyReLU(),
-            nn.Conv3d(self.backbone.out_channels, cfg.heads.classification.num_classes + 1, kernel_size=3, padding='same')
+            nn.ReLU(),
+            nn.Conv3d(self.backbone.out_channels, cfg.heads.classification.num_classes + 1, kernel_size=1, padding='same')
         )
 
         # -------------------- loss functions ---------------------
@@ -247,77 +246,31 @@ class CondInst3dPRL(pl.LightningModule):
         B, A, C = cls_logits.shape
         device = cls_logits.device
 
-        all_gt_class_ids = torch.stack([x.gt_classes for x in instance_data_list], dim=0)  # [B, A]
-        pos_mask = all_gt_class_ids >= 0  # [B, A]
-        neg_mask = ~pos_mask
+        # [B, A] with class ids for positives, -1 for negatives
+        all_gt_class_ids = torch.stack([x.gt_classes for x in instance_data_list], dim=0)
 
-        # --- build onehot targets (only set positives) ---
-        gt_onehot = torch.zeros_like(cls_logits)
+        # positives are anchors with matched GT
+        pos_mask = all_gt_class_ids >= 0  # [B, A]
+
+        # one-hot targets for focal (multi-label sigmoid formulation)
+        gt_onehot = torch.zeros((B, A, C), device=device, dtype=cls_logits.dtype)
         if pos_mask.any():
             b_idx, a_idx = pos_mask.nonzero(as_tuple=True)  # [Npos]
-            c_idx = all_gt_class_ids[b_idx, a_idx].long().clamp_(0, C - 1)
+            c_idx = all_gt_class_ids[b_idx, a_idx].long().clamp(0, C - 1)
             gt_onehot[b_idx, a_idx, c_idx] = 1.0
 
-        # --- per-entry loss (expects reduction="none") ---
-        # returns [B, A, C] typically
+        # focal loss per entry: [B, A, C] (expects reduction="none")
         loss_per_entry = self.losses["classification"](cls_logits, gt_onehot)
 
-        # reduce class dim -> [B, A]
+        # reduce over classes -> [B, A]
         loss_per_anchor = loss_per_entry.sum(dim=-1)
 
-        # ---------------- per-image hard negative mining ----------------
-        neg_pos_ratio = int(getattr(self.cfg.losses, "neg_pos_ratio", 3)) if hasattr(self, "cfg") else 3
-        max_neg_per_image = int(getattr(self.cfg.losses, "max_neg_per_image", 5000)) if hasattr(self, "cfg") else 5000
+        # sum over all anchors in the batch
+        loss_sum = loss_per_anchor.sum()
 
-        # How many positives per image?
-        num_pos_per_img = pos_mask.sum(dim=1)  # [B]
-
-        # How many negatives to keep per image?
-        # keep at least some negatives even when num_pos=0
-        min_neg_when_no_pos = int(getattr(self.cfg.losses, "min_neg_when_no_pos", 50)) if hasattr(self, "cfg") else 50
-
-        num_neg_per_img = neg_pos_ratio * torch.clamp(num_pos_per_img, min=1)  # [B]
-        num_neg_per_img = torch.minimum(num_neg_per_img, neg_mask.sum(dim=1))  # can't exceed available negs
-        num_neg_per_img = torch.clamp(num_neg_per_img, max=max_neg_per_image)
-
-        # if an image has 0 positives, keep a small fixed number of negatives
-        no_pos = (num_pos_per_img == 0)
-        if no_pos.any():
-            num_neg_per_img = num_neg_per_img.clone()
-            num_neg_per_img[no_pos] = torch.minimum(
-                neg_mask.sum(dim=1)[no_pos],
-                torch.as_tensor(min_neg_when_no_pos, device=device, dtype=num_neg_per_img.dtype),
-            )
-
-        # build selected negatives mask
-        selected_neg = torch.zeros((B, A), device=device, dtype=torch.bool)
-
-        # detach mining signal so selection doesn't backprop
-        mining_scores = loss_per_anchor.detach()
-
-        # loop over batch (B is small; A is huge, so this is fine)
-        for b in range(B):
-            k = int(num_neg_per_img[b].item())
-            if k <= 0:
-                continue
-            neg_idx = torch.where(neg_mask[b])[0]  # [Nneg_b]
-            if neg_idx.numel() == 0:
-                continue
-            neg_losses_b = mining_scores[b, neg_idx]  # [Nneg_b]
-
-            if k < neg_idx.numel():
-                topk = torch.topk(neg_losses_b, k=k, largest=True, sorted=False).indices
-                chosen = neg_idx[topk]
-            else:
-                chosen = neg_idx
-
-            selected_neg[b, chosen] = True
-
-        sample_mask = pos_mask | selected_neg  # [B, A]
-
-        # normalize by number of sampled anchors (pos + selected neg)
-        denom = sample_mask.sum().clamp(min=1).to(loss_per_anchor.dtype)
-        loss_cls = (loss_per_anchor * sample_mask).sum() / denom
+        # normalize by number of positives (RetinaNet-style); avoid div by 0
+        num_pos = pos_mask.sum().to(loss_sum.dtype)
+        loss_cls = loss_sum / torch.clamp(num_pos, min=1.0)
 
         return loss_cls, instance_data_list
 
@@ -381,7 +334,7 @@ class CondInst3dPRL(pl.LightningModule):
         return {
             "classification": classification_loss,
             "instance_segmentation": segmentation_losses["instance_segmentation"],
-            "semantic_segmentation": segmentation_losses["semantic_segmentation"],
+            "semantic_segmentation": 0.5 * segmentation_losses["semantic_segmentation"],
         }
 
     # ---------------- Inference: detections + seg ----------------
