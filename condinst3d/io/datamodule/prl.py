@@ -30,7 +30,7 @@ def build_cases(cases, modalities, image_directory, label_directory):
         for i, m in enumerate(modalities):
             case_dict[m] = os.path.join(image_directory, f"{case}_{i:04d}.nii.gz")
         case_dict['instance_mask'] = os.path.join(label_directory, f"{case}.nii.gz")
-        case_dict['brain_mask'] = os.path.join(image_directory, f"{case}_brainmask.nii.gz")
+        case_dict['brain_mask'] = os.path.join(image_directory, "brainmask", f"{case}_brainmask.nii.gz")
         with open(os.path.join(label_directory, f"{case}.json"), "r") as f:
             info = json.load(f)
         case_dict["info"] = info
