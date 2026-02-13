@@ -170,4 +170,4 @@ class ResidualUnetRDecoder(nn.Module):
             ups.append(up_j)
 
         output = self.output_block(ups[-1])
-        return [*ups, output]
+        return [encoder_feats[-1], *ups, output]

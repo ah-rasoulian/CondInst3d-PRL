@@ -82,7 +82,7 @@ class UNetRBackboneBase(AbstractBackbone):
         We create convs for encoder resolution levels >= head_start_index.
         """
         modules: List[nn.Module | None] = []
-        for i in range(len(self.filters) - 1):
+        for i in range(len(self.filters)):
             if i < self.head_start_index:
                 conv = None
             else:
@@ -105,7 +105,7 @@ class UNetRBackboneBase(AbstractBackbone):
         output = decoder_feats[-1]
 
         heads = []
-        for i in range(len(self.filters) - 1):
+        for i in range(len(self.filters)):
             head_map = self.head_mappings[i]
             if head_map is not None:
                 heads.append(head_map(decoder_feats[i]))
