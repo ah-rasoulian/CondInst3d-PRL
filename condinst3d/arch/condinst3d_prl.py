@@ -334,7 +334,7 @@ class CondInst3dPRL(pl.LightningModule):
         return {
             "classification": classification_loss,
             "instance_segmentation": segmentation_losses["instance_segmentation"],
-            "semantic_segmentation": 0.5 * segmentation_losses["semantic_segmentation"],
+            "semantic_segmentation": segmentation_losses["semantic_segmentation"],
         }
 
     # ---------------- Inference: detections + seg ----------------
