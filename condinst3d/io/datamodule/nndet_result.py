@@ -6,9 +6,10 @@ from pytorch_lightning.utilities.types import EVAL_DATALOADERS
 from torch.utils.data import DataLoader
 import torch
 import numpy as np
-from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, ConcatItemsd, DeleteItemsd, Lambdad, CopyItemsd
-from condinst3d.io.transforms import (LoadInfod, InstanceMaskToDetd, SemanticToInstanced, InstanceScoresFromSoftmaxd,
-                                      FilterAndUnpackPredsd, MatchSegBoxesToPredScoresd)
+from monai.transforms import (Compose, LoadImaged, EnsureChannelFirstd, ConcatItemsd, DeleteItemsd, Lambdad, CopyItemsd,
+                              ToTensord)
+from condinst3d.io.transforms import (LoadInfod, InstanceMaskToDetd, SemanticToInstanced, FilterAndUnpackPredsd,
+                                      MatchSegBoxesToPredScoresd, MaskedPercentileNormalizeIntensityd)
 from functools import partial
 from condinst3d.io.collate import multi_instance_collate
 
@@ -32,6 +33,7 @@ class nnDetectionResult(pl.LightningDataModule):
         for case_name in case_names:
             case_dict = {
                 "case": case_name,
+                "brain_mask": os.path.join(test_images_dir, "brainmask", f"{case_name}_brainmask.nii.gz"),
                 "instance_mask": os.path.join(test_labels_dir, f"{case_name}.nii.gz"),
                 "instance_mask_info": os.path.join(test_labels_dir, f"{case_name}.json"),
                 "pred_boxes": os.path.join(pred_root, f"{case_name}_boxes.pkl"),
@@ -79,7 +81,7 @@ class nnDetectionResult(pl.LightningDataModule):
 
     def _get_load_transforms(self):
         return [
-            LoadImaged(keys=self.modalities),
+            LoadImaged(keys=self.modalities + ["brain_mask"]),
             LoadImaged(keys=["instance_mask"]),
             LoadInfod(keys=["pred_boxes", "pred_seg"]),
             FilterAndUnpackPredsd(
@@ -89,7 +91,7 @@ class nnDetectionResult(pl.LightningDataModule):
                 out_scores_key="pred_scores_f",
                 out_labels_key="pred_classes_f"
             ),
-            DeleteItemsd(["pred_boxes"]),
+            ToTensord(keys=["pred_boxes_f", "pred_scores_f", "pred_classes_f"]),
             Lambdad(keys="pred_seg", func=lambda x: np.transpose(x['pred_seg'], (2, 1, 0))),
 
             CopyItemsd(keys=["instance_mask"], times=1, names=["semantic_mask"]),
@@ -97,7 +99,16 @@ class nnDetectionResult(pl.LightningDataModule):
 
             EnsureChannelFirstd(keys=self.modalities + ["instance_mask", "semantic_mask", "pred_seg"], channel_dim='no_channel'),
             ConcatItemsd(keys=self.modalities, name="inputs", dim=0),
-            DeleteItemsd(keys=self.modalities),
+
+            # normalize input intensities
+            MaskedPercentileNormalizeIntensityd(
+                keys=["inputs"],
+                mask_key="brain_mask",
+                percentiles=(0.5, 99.5),
+                channel_wise=True,
+                z_clamp=(-6.0, 6.0),
+            ),
+            DeleteItemsd(self.modalities + ["pred_boxes", "brain_mask"]),
         ]
 
     def _get_det_transforms(self):

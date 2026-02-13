@@ -7,9 +7,60 @@ from torch.utils.data import DataLoader
 import torch
 import numpy as np
 from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, ConcatItemsd, DeleteItemsd, Lambdad, CopyItemsd
-from condinst3d.io.transforms import LoadInfod, InstanceMaskToDetd, SemanticToInstanced, InstanceScoresFromSoftmaxd
+from condinst3d.io.transforms import (LoadInfod, InstanceMaskToDetd, SemanticToInstanced, InstanceScoresFromSoftmaxd,
+                                      MaskedPercentileNormalizeIntensityd)
 from functools import partial
 from condinst3d.io.collate import multi_instance_collate
+from dataclasses import dataclass
+from typing import Any, Dict, Hashable, Mapping
+from monai.transforms import MapTransform
+
+
+@dataclass
+class ReadAndRestoreNPZSoftmaxd(MapTransform):
+    """
+    Read a cropped softmax from an .npz file, permute axes, and pad it back
+    to the original image size.
+
+    Expects:
+      - d[softmax_key]: path to .npz file containing array 'softmax'
+      - d[info_key] contains:
+          - crop_bbox: [[z0,z1],[y0,y1],[x0,x1]]
+          - original_size_of_raw_data: (Zo, Yo, Xo)
+
+    Output:
+      - d[softmax_key]: softmax tensor of shape [C, Xo, Yo, Zo]
+    """
+
+    softmax_key: Hashable
+    info_key: Hashable
+    allow_missing_keys: bool = False
+
+    def __post_init__(self):
+        super().__init__([self.softmax_key, self.info_key], allow_missing_keys=self.allow_missing_keys)
+
+    def __call__(self, data: Mapping[Hashable, Any]) -> Dict[Hashable, Any]:
+        d = dict(data)
+
+        # ---- load npz ----
+        path = d[self.softmax_key]
+        sm = np.load(path)["softmax"]              # (C, Z, Y, X)
+
+        # ---- restore crop ----
+        info = d[self.info_key]
+        (z0, z1), (y0, y1), (x0, x1) = info["crop_bbox"]
+        Zo, Yo, Xo = info["original_size_of_raw_data"]
+
+        C = sm.shape[0]
+        out = np.zeros((C, Zo, Yo, Xo), dtype=sm.dtype)
+        out[0, :] = 1  # background prob = 1 everywhere by default
+        out[:, z0:z1, y0:y1, x0:x1] = sm
+        out = np.transpose(out, (0, 3, 2, 1))        # -> (C, X, Y, Z)
+
+        # ---- return torch if needed ----
+        d[self.softmax_key] = torch.as_tensor(out) if isinstance(path, torch.Tensor) else out
+        return d
+
 
 
 class nnUNetResult(pl.LightningDataModule):
@@ -29,6 +80,7 @@ class nnUNetResult(pl.LightningDataModule):
         for case_name in case_names:
             case_dict = {
                 "case": case_name,
+                "brain_mask": os.path.join(test_images_dir, "brainmask", f"{case_name}_brainmask.nii.gz"),
                 "instance_mask": os.path.join(test_labels_dir, f"{case_name}.nii.gz"),
                 "instance_mask_info": os.path.join(test_labels_dir, f"{case_name}.json"),
                 "pred_bin": os.path.join(pred_root, f"{case_name}.nii.gz"),
@@ -69,16 +121,28 @@ class nnUNetResult(pl.LightningDataModule):
 
     def _get_load_transforms(self):
         return [
-            LoadImaged(keys=self.modalities),
+            LoadImaged(keys=self.modalities + ["brain_mask"]),
             LoadImaged(keys=["instance_mask", "pred_bin"]),
             LoadInfod(keys=["instance_mask_info", "pred_info"]),
-            Lambdad(keys=["pred_softmax"], func=lambda x: np.transpose(np.load(x)['softmax'], (0, 3, 2, 1))),
+            ReadAndRestoreNPZSoftmaxd(
+                softmax_key="pred_softmax",
+                info_key="pred_info",
+            ),
             CopyItemsd(keys=["instance_mask"], times=1, names=["semantic_mask"]),
             Lambdad(keys=["semantic_mask"], func=lambda x: (x > 0).float()),
 
             EnsureChannelFirstd(keys=self.modalities + ["instance_mask", "semantic_mask", "pred_bin"], channel_dim='no_channel'),
             ConcatItemsd(keys=self.modalities, name="inputs", dim=0),
-            DeleteItemsd(keys=self.modalities),
+
+            # normalize input intensities
+            MaskedPercentileNormalizeIntensityd(
+                keys=["inputs"],
+                mask_key="brain_mask",
+                percentiles=(0.5, 99.5),
+                channel_wise=True,
+                z_clamp=(-6.0, 6.0),
+            ),
+            DeleteItemsd(self.modalities + ["brain_mask"]),
         ]
 
     def _get_det_transforms(self):
