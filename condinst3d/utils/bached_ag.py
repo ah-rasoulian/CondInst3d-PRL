@@ -95,7 +95,7 @@ def aggregate_per_patch_detections(
 
     Output (per image):
       - instance_mask:        [1,H,W,D] int64 (0=bg, 1..G)
-      - onehot_instance_mask: [G,1,H,W,D] bool
+      - onehot: [G,1,H,W,D] bool
       - bboxes:               [G,6] global boxes
       - centers:              [G,3] global centers
       - strides:              [G,3]
@@ -150,7 +150,7 @@ def aggregate_per_patch_detections(
         onehot = torch.zeros((0, 1, H, W, D), dtype=torch.bool, device=device)
         return {
             "instance_mask": instance_mask,
-            "onehot_instance_mask": onehot,
+            "onehot": onehot,
             "bboxes": torch.zeros((0, 6), dtype=torch.float32, device=device),
             "centers": torch.zeros((0, 3), dtype=torch.float32, device=device),
             "strides": torch.zeros((0, 3), dtype=torch.float32, device=device),
@@ -295,7 +295,7 @@ def aggregate_per_patch_detections(
         empty_onehot = torch.zeros((0, 1, H, W, D), dtype=torch.bool, device=device)
         return {
             "instance_mask": torch.zeros((1, H, W, D), dtype=torch.int64, device=device),
-            "onehot_instance_mask": empty_onehot,
+            "onehot": empty_onehot,
             "bboxes": torch.zeros((0, 6), dtype=torch.float32, device=device),
             "centers": torch.zeros((0, 3), dtype=torch.float32, device=device),
             "strides": torch.zeros((0, 3), dtype=torch.float32, device=device),
@@ -306,7 +306,7 @@ def aggregate_per_patch_detections(
 
     return {
         "instance_mask": relabel_sequential(instance_mask, exclude_background=True), # [1,H,W,D]
-        "onehot_instance_mask": onehot_global[remained_idx],  # [G',1,H,W,D]
+        "onehot": onehot_global[remained_idx],  # [G',1,H,W,D]
         "bboxes": out_boxes[remained_idx],                    # [G',6]
         "centers": out_centers[remained_idx],                 # [G',3]
         "strides": out_strides[remained_idx],                 # [G',3]
