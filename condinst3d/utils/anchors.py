@@ -1,6 +1,6 @@
 from typing import Literal, Callable, Sequence, Tuple
 from monai.apps.detection.utils.ATSS_matcher import Matcher
-from monai.data.box_utils import box_iou, centers_in_boxes, box_centers
+from monai.data.box_utils import box_iou, box_centers
 import torch
 from torch import Tensor
 from monai.utils.type_conversion import convert_data_type, convert_to_dst_type, convert_to_tensor
@@ -63,6 +63,7 @@ class AnisotropicATSSMatcher(Matcher):
     def __init__(
         self,
         num_candidates: int = 4,
+        min_pos: int = 3,
         similarity_fn: Callable[[Tensor, Tensor], Tensor] = box_iou,  # type: ignore
         center_in_gt: bool = True,
         threshold_strategy: Literal["default", "topk", "mean"] = "default",
@@ -85,6 +86,7 @@ class AnisotropicATSSMatcher(Matcher):
         """
         super().__init__(similarity_fn=similarity_fn)
         self.num_candidates = num_candidates
+        self.min_pos = min_pos
         self.min_dist = 0.01
         self.center_in_gt = center_in_gt
         self.threshold_strategy = threshold_strategy
@@ -105,7 +107,7 @@ class AnisotropicATSSMatcher(Matcher):
         num_gt = boxes.shape[0]
         num_anchors = anchors.shape[0]
 
-        distances_, _, anchors_center = boxes_center_distance(boxes, anchors)  # num_boxes x anchors
+        distances_, _, anchors_center = boxes_center_distance(boxes, anchors, spacing=spacing)  # num_boxes x anchors
         distances = convert_to_tensor(distances_)
 
         # select candidates based on center distance
@@ -115,7 +117,10 @@ class AnisotropicATSSMatcher(Matcher):
             end_idx = start_idx + apl * num_anchors_per_loc
 
             # topk: total number of candidates per position
-            topk = min(self.num_candidates * num_anchors_per_loc, apl)
+            n_loc = apl
+            k_loc = min(self.num_candidates, n_loc)
+            topk = k_loc * num_anchors_per_loc
+
             # torch.topk() does not support float16 cpu, need conversion to float32 or float64
             _, idx = distances[:, start_idx:end_idx].to(torch.float32).topk(topk, dim=1, largest=False)
             # idx: shape [num_boxes x topk]
@@ -166,6 +171,28 @@ class AnisotropicATSSMatcher(Matcher):
             )
             is_in_gt = convert_to_tensor(is_in_gt_)
             is_pos = is_pos & is_in_gt.view_as(is_pos)  # [num_boxes x n_candidates]
+
+        if self.min_pos > 0:
+            for g in range(num_gt):
+                if is_pos[g].any():
+                    continue
+
+                # First try: pick best IoU candidate that is inside GT (if any)
+                if self.center_in_gt:
+                    inside = is_in_gt.view_as(is_pos)[g]  # [n_candidates]
+                    if inside.any():
+                        # choose top min_pos by IoU among inside candidates
+                        vals = candidate_ious[g].clone()
+                        vals[~inside] = -INF
+                        topk = min(self.min_pos, inside.sum().item())
+                        _, sel = vals.topk(topk, largest=True)
+                        is_pos[g, sel] = True
+                        continue
+
+                # Fallback: pick top min_pos by IoU among all candidates (even if outside)
+                topk = min(self.min_pos, candidate_ious.shape[1])
+                _, sel = candidate_ious[g].topk(topk, largest=True)
+                is_pos[g, sel] = True
 
         # in case on anchor is assigned to multiple boxes, use box with highest IoU
         for ng in range(num_gt):
