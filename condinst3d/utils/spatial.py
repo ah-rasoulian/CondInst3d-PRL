@@ -93,7 +93,7 @@ def boxes_center_distance(
 
     diff = center1[:, None] - center2[None]
     if spacing is not None:
-        spacing_t, *_ = convert_data_type(spacing, torch.Tensor)
+        spacing_t, *_ = convert_data_type(spacing, torch.Tensor, device=diff.device)
         diff = diff * spacing_t[None, None].to(COMPUTE_DTYPE)
     if euclidean:
         dists = diff.pow(2).sum(-1).sqrt()  # type: ignore
