@@ -15,21 +15,13 @@ class ControllerHead(nn.Module):
     ):
         super().__init__()
         self.num_params = num_params
-        self.conv1 = SEBlock(
-            spatial_dims=3,
-            in_channels=in_channels,
-            n_chns_1=in_channels // 2,
-            n_chns_2=in_channels // 2,
-            n_chns_3=in_channels,
-            r=4,
-        )
-        self.conv2 = ResBlock(
+        self.conv1 = ResBlock(
             spatial_dims=3,
             in_channels=in_channels,
             norm=("INSTANCE", {"affine": True}),
             kernel_size=3,
         )
-        self.conv3 = ResBlock(
+        self.conv2 = ResBlock(
             spatial_dims=3,
             in_channels=in_channels,
             norm=("INSTANCE", {"affine": True}),
@@ -44,7 +36,6 @@ class ControllerHead(nn.Module):
         for feats in features:
             param_feat = self.conv1(feats)
             param_feat = self.conv2(param_feat)
-            param_feat = self.conv3(param_feat)
             params_logits = self.param_pred(param_feat)
 
             # Permute classification output from (N, K, W, H, D) to (N, WHD, K).

@@ -16,21 +16,13 @@ class ClassificationHead(nn.Module):
     ):
         super().__init__()
         self.num_classes = num_classes
-        self.conv1 = SEBlock(
-            spatial_dims=3,
-            in_channels=in_channels,
-            n_chns_1=in_channels // 2,
-            n_chns_2=in_channels // 2,
-            n_chns_3=in_channels,
-            r=4,
-        )
-        self.conv2 = ResBlock(
+        self.conv1 = ResBlock(
             spatial_dims=3,
             in_channels=in_channels,
             norm=("INSTANCE", {"affine": True}),
             kernel_size=3,
         )
-        self.conv3 = ResBlock(
+        self.conv2 = ResBlock(
             spatial_dims=3,
             in_channels=in_channels,
             norm=("INSTANCE", {"affine": True}),
@@ -46,7 +38,6 @@ class ClassificationHead(nn.Module):
         for feats in features:
             cls_feat = self.conv1(feats)
             cls_feat = self.conv2(cls_feat)
-            cls_feat = self.conv3(cls_feat)
             logits = self.cls_logits(cls_feat)
 
             # Permute classification output from (N, K, W, H, D) to (N, WHD, K).
