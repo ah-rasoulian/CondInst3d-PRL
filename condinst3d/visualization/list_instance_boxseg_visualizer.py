@@ -71,8 +71,13 @@ class ListInstanceBoxSegSliceVisualizer(InstanceSegSliceVisualizer):
                 if title:
                     self._plot_title(fig, title + " / TP {}".format(tp_ids[i]))
                 if add_info_text:
-                    info = (f"IoU={stats['y_pred'][tp_map_ids[i][1]]['iou'][0]:.2f}\n"
-                            f"Score={stats['y_pred'][tp_map_ids[i][1]]['score']:.2f}")
+                    info = ""
+                    iou = stats['y_pred'][tp_map_ids[i][1]].get('iou', None)
+                    if iou is not None:
+                        info += f"IoU={iou[0]:.2f}\n"
+                    score = stats['y_pred'][tp_map_ids[i][1]].get('score', None)
+                    if score is not None:
+                        info += f"Score={score:.2f}\n]"
                     self._add_text_top_right(fig, info)
                 fig = self._close_fig(fig)
                 figs["tp{}".format(tp_ids[i])] = fig
