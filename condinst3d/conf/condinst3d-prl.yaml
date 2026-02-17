@@ -158,4 +158,5 @@ data:
   patch_size: [128, 128, 48]
   patches_per_subject: 2
   patch_overlap: 0.25
-  augmentation_prob: 0.5
+  spatial_augmentation_prob: 0.5
+  intensity_augmentation_prob: 0.5
