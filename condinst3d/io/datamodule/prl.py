@@ -1,5 +1,5 @@
 from typing import Any
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 import pytorch_lightning as pl
 import torch
 from monai.data import Dataset
@@ -11,7 +11,7 @@ import os
 from monai.transforms import (
     Compose,
     LoadImaged, Lambdad, EnsureChannelFirstd, EnsureTyped, ConcatItemsd, DeleteItemsd, CropForegroundd,
-    RandWeightedCropd, RandSpatialCropd, GridPatchd, ApplyPendingd,
+    RandWeightedCropd, RandSpatialCropd, GridPatchd,
     RandRotated, RandZoomd, RandFlipd, OneOf, RandRicianNoised, RandGaussianNoised,
     RandScaleIntensityd, RandShiftIntensityd, RandAdjustContrastd, RandGaussianSharpend, CopyItemsd,
 )
@@ -19,7 +19,6 @@ import numpy as np
 from condinst3d.io.transforms import (MaskedPercentileNormalizeIntensityd, InstanceMaskToDetd,
                                       MakeBalancedInstanceWeightMapd, SpatialPadWithMind, SymmetricGridPadWithMind)
 from condinst3d.io.collate import multi_instance_collate
-from condinst3d.io.sampler import DistributedWeightedSampler
 from functools import partial
 
 
@@ -67,7 +66,8 @@ class PRLDataModule(pl.LightningDataModule):
         self.patch_size = cfg.patch_size
         self.patches_per_subject = cfg.patches_per_subject
         self.patch_overlap = cfg.patch_overlap
-        self.augmentation_prob = cfg.augmentation_prob
+        self.spatial_augmentation_prob = cfg.spatial_augmentation_prob
+        self.intensity_augmentation_prob = cfg.intensity_augmentation_prob
         self.collate_fn = partial(
             multi_instance_collate,
             collate_keys=['inputs', 'inputs_orig', 'instance_mask', 'semantic_mask', 'boxes', 'classes', 'onehot'],
@@ -145,64 +145,65 @@ class PRLDataModule(pl.LightningDataModule):
         ]
 
     def _get_augmentation_transorms(self):
+        keys_all = ["inputs", "instance_mask", "semantic_mask"]
+
         return [
-            # spatial augmentation
+            # ---------------------------
+            # spatial augmentation (XY only)
+            # ---------------------------
+
+            # rotate only in the XY plane (no XZ/YZ rotations)
             RandRotated(
-                keys=['inputs', 'instance_mask', 'semantic_mask'],
-                range_x=np.pi / 4, range_y=np.pi / 4, range_z=np.pi / 4,
-                prob=self.augmentation_prob,
+                keys=keys_all,
+                range_x=0.0,  # rotation about x (affects YZ) -> disable
+                range_y=0.0,  # rotation about y (affects XZ) -> disable
+                range_z=np.pi / 12,  # rotation about z (in-plane XY) -> keep
+                prob=self.spatial_augmentation_prob,
                 keep_size=False,
                 mode=["bilinear", "nearest", "nearest"],
-                lazy=True,
             ),
-            RandZoomd(
-                keys=['inputs', 'instance_mask', 'semantic_mask'],
-                prob=self.augmentation_prob,
-                min_zoom=0.75, max_zoom=1.25,
-                mode=["trilinear", "nearest-exact", "nearest-exact"],
-                keep_size=False,
-                lazy=True,
-            ),
-            RandFlipd(
-                keys=['inputs', 'instance_mask', 'semantic_mask'],
-                prob=self.augmentation_prob,
-                spatial_axis=[0, 1, 2],
-                lazy=True,
-            ),
-            ApplyPendingd(keys=["inputs", "instance_mask", "semantic_mask"]),
 
+            # zoom only in XY (keep z zoom = 1.0)
+            RandZoomd(
+                keys=keys_all,
+                prob=self.spatial_augmentation_prob,
+                min_zoom=(0.9, 0.9, 1.0),
+                max_zoom=(1.1, 1.1, 1.0),
+                mode=["bilinear", "nearest", "nearest"],
+                keep_size=False,
+            ),
+
+            # flips only along X and Y and Z
+            RandFlipd(
+                keys=keys_all,
+                prob=self.spatial_augmentation_prob,
+                spatial_axis=[0, 1],
+            ),
+
+            # ---------------------------
             # intensity augmentation
-            RandScaleIntensityd(
-                keys=['inputs'],
-                prob=self.augmentation_prob,
-                factors=0.25,
-            ),
-            RandShiftIntensityd(
-                keys=['inputs'],
-                prob=self.augmentation_prob,
-                offsets=0.1,
-            ),
-            RandAdjustContrastd(
-                keys=['inputs'],
-                prob=self.augmentation_prob,
-                gamma=(0.7, 1.5),
-            ),
-            RandGaussianSharpend(
-                keys=['inputs'],
-                prob=self.augmentation_prob,
-            ),
+            # ---------------------------
             OneOf([
-                RandRicianNoised(
-                    keys=['inputs'],
-                    prob=self.augmentation_prob,
-                    channel_wise=True,
-                    relative=True,
+                RandScaleIntensityd(
+                    keys=["inputs"],
+                    prob=self.intensity_augmentation_prob,
+                    factors=0.1,
+                ),
+                RandShiftIntensityd(
+                    keys=["inputs"],
+                    prob=self.intensity_augmentation_prob,
+                    offsets=0.03,
+                ),
+                RandAdjustContrastd(
+                    keys=["inputs"],
+                    prob=self.intensity_augmentation_prob,
+                    gamma=(0.9, 1.1),
                 ),
                 RandGaussianNoised(
-                    keys=['inputs'],
-                    prob=self.augmentation_prob,
-                    std=0.01,
-                )
+                    keys=["inputs"],
+                    prob=self.intensity_augmentation_prob,
+                    std=0.005,
+                ),
             ]),
         ]
 
@@ -216,14 +217,12 @@ class PRLDataModule(pl.LightningDataModule):
                 w_key="inst_wmap",
                 spatial_size=np.array(self.patch_size) * 1.5,
                 num_samples=self.patches_per_subject,
-                lazy=True,
             ),
 
             RandSpatialCropd(
                 keys=["inputs", "instance_mask", "semantic_mask"],
                 roi_size=self.patch_size,
                 random_center=True,
-                lazy=True,
             ),
 
             # pad inputs with background-like value in normalized space; masks with 0
@@ -232,8 +231,6 @@ class PRLDataModule(pl.LightningDataModule):
                 mask_keys=["instance_mask", "semantic_mask"],
                 spatial_size=self.patch_size,
             ),
-
-            ApplyPendingd(keys=["inputs", "instance_mask", "semantic_mask"]),
         ]
 
     def _get_grid_patches_transforms(self):
@@ -318,23 +315,13 @@ class PRLDataModule(pl.LightningDataModule):
         return batch
 
     def _get_dataloader(self, subset):
-        sampler = None
+        dataset = self.datasets[subset]
         shuffle = (subset == "train")
 
-        if subset == "train" and hasattr(self, "train_weights"):
-            sampler = DistributedWeightedSampler(
-                self.train_weights,
-                num_samples=len(self.train_weights),  # one "epoch"
-                replacement=True,
-                seed=42,
-            )
-            shuffle = False
-
         return DataLoader(
-            dataset=self.datasets[subset],
+            dataset=dataset,
             batch_size=self.batch_size[subset],
-            sampler=sampler,
-            shuffle=shuffle if sampler is None else False,
+            shuffle=shuffle,
             num_workers=self.num_workers[subset],
             collate_fn=self.collate_fn,
             pin_memory=True,
