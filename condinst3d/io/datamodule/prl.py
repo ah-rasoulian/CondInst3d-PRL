@@ -17,7 +17,7 @@ from monai.transforms import (
 )
 import numpy as np
 from condinst3d.io.transforms import (MaskedPercentileNormalizeIntensityd, InstanceMaskToDetd,
-                                      MakeBalancedInstanceWeightMapd, SpatialPadWithMind, SymmetricGridPadWithMind)
+                                      MakeBalancedInstanceWeightMapd, SpatialPadWithMind, SymmetricGridPad)
 from condinst3d.io.collate import multi_instance_collate
 from functools import partial
 
@@ -133,7 +133,6 @@ class PRLDataModule(pl.LightningDataModule):
                 mask_key="brain_mask",
                 percentiles=(0.5, 99.5),
                 channel_wise=True,
-                z_clamp=(-6.0, 6.0),
             ),
 
             # delete individual mods and brain_mask
@@ -238,9 +237,8 @@ class PRLDataModule(pl.LightningDataModule):
             CopyItemsd(keys=["inputs"], times=1, names=["inputs_orig"]),
 
             # Symmetric, min-value padding so first/last patches are equally affected
-            SymmetricGridPadWithMind(
+            SymmetricGridPad(
                 keys=["inputs", "inputs_orig", "instance_mask", "semantic_mask"],
-                mask_keys=["instance_mask", "semantic_mask"],
                 patch_size=self.patch_size,
                 overlap=self.patch_overlap,
             ),

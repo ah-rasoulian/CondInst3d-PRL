@@ -92,7 +92,7 @@ def _to_overlap_voxels(patch: Tuple[int, int, int],
     return tuple(int(round(o)) for o in ov)
 
 
-class SymmetricGridPadWithMind(MapTransform):
+class SymmetricGridPad(MapTransform):
     """
     Symmetrically pad so that (dim_padded - patch) is divisible by stride,
     where stride = patch - overlap_voxels.
@@ -107,11 +107,9 @@ class SymmetricGridPadWithMind(MapTransform):
         keys,
         patch_size: Sequence[int],
         overlap: Union[float, Sequence[Union[int, float]]],
-        mask_keys=(),
         allow_missing_keys: bool = False,
     ):
         super().__init__(keys, allow_missing_keys)
-        self.mask_keys = mask_keys
 
         self.patch_size = tuple(int(x) for x in ensure_tuple_rep(patch_size, 3))
         self.overlap_vox = _to_overlap_voxels(self.patch_size, overlap)
@@ -152,12 +150,8 @@ class SymmetricGridPadWithMind(MapTransform):
             py0, py1 = py // 2, py - py // 2
             pz0, pz1 = pz // 2, pz - pz // 2
 
-            if k in self.mask_keys:
-                pad_val = 0
-            else:
-                pad_val = float(x.min().item())
             pad = (pz0, pz1, py0, py1, px0, px1)  # torch pad order for 3D
 
-            d[k] = torch.nn.functional.pad(x, pad, mode="constant", value=pad_val)
+            d[k] = torch.nn.functional.pad(x, pad, mode="constant", value=0)
 
         return d
