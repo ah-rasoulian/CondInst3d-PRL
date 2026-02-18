@@ -35,37 +35,38 @@ train:
     precision: bf16-mixed
     max_epochs: 1000
     gradient_clip_algorithm: norm
-    gradient_clip_val: 1.0
+    gradient_clip_val: 0.5
     accumulate_grad_batches: 2
-    num_sanity_val_steps: 0
+    num_sanity_val_steps: 5
     check_val_every_n_epoch: 10
-    log_every_n_steps: 1
+    log_every_n_steps: 10
     limit_train_batches: 1.0
     limit_val_batches: 1.0
     enable_progress_bar: true
     enable_model_summary: true
-    enable_checkpointing: true
 
 model:
   forward_chunk_size: 16
-  max_mask_to_train: 256
+  max_mask_to_train: 384
 
   backbone:
     _target_: condinst3d.arch.backbone.unetr_specific_mod.UNetRSpecificMod
 
     specific_modality_index: 3
     in_channels: 4
-    filters: [ 32, 48, 64, 96, 128, 160, 192 ]
-    kernels: [ [ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ] ]
-    strides: [ [ 1,1,1 ],[ 2,2,1 ],[ 2,2,1 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2 ] ]
-    head_start_index: 3
+    filters: [ 32, 64, 96, 128, 192, 256 ]
+    kernels: [ [ 3,3,1 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ],[ 3,3,3 ] ]
+    strides: [ [ 1,1,1 ],[ 2,2,1 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,2 ],[ 2,2,1 ] ]
+    head_start_index: 2
     heads_dim: 128
     out_channels: 8
 
   matcher:
-    num_candidates: 12
-    center_in_gt: False
-    anchors_sizes: [ [ 8,8,2 ], [ 16,16,4 ], [ 32,32,8 ] ]
+    num_candidates: 25
+    min_pos: 3
+    center_in_gt: true
+    anchors_sizes: [ [ 4,4,2 ], [ 8,8,4 ], [ 16,16,8 ], [ 32, 32, 8 ] ]
+#    anchors_sizes: [ [ 8,8,4 ], [ 16,16,8 ], [ 32,32,16 ], [ 48, 48, 16 ] ]
 
   heads:
     classification:
@@ -79,36 +80,42 @@ model:
       size_of_interest: 4
 
     controller:
-      num_layers: 3
+      num_layers: 2
 
   losses:
     classification:
-      _target_: condinst3d.losses.focal.FocalLoss
-      alpha: 0.8
+      _target_: monai.losses.FocalLoss
+      to_onehot_y: false
+      use_softmax: false
       gamma: 2.0
-      reduction: none
+      alpha: 0.25
+      reduction: "none"
 
     instance_segmentation:
-      _target_: condinst3d.losses.dice_focal.DiceFocalLoss
-      alpha: 0.8
+      _target_: monai.losses.DiceFocalLoss
+      to_onehot_y: false
+      sigmoid: true
       gamma: 2.0
+      lambda_dice: 1.0
+      lambda_focal: 1.0
       reduction: "mean"
 
     semantic_segmentation:
       _target_: monai.losses.DiceFocalLoss
       include_background: false
+      to_onehot_y: true
       softmax: true
-      reduction: "mean"
-      to_onehot_y: True
-      alpha: 0.8
       gamma: 2.0
+      lambda_dice: 1.0
+      lambda_focal: 1.0
+      reduction: "mean"
 
   inference:
     mask_thresh: 0.5
     score_thresh: 0.5
     nms_thresh: 0.5
     group_thresh: 0.5
-    topk_candidates: 15
+    topk_candidates: 20
 
   evaluation:
     iou_list: [ 0.01, 0.1, 0.2, 0.3, 0.4, 0.5 ]
@@ -119,18 +126,18 @@ model:
     channel_seg_under_image: 3
     crop_size: [96, 96]
     show_slices: [-1, 0, 1]
-    figsize: 2.0
+    figsize: 1.5
     num_images_to_show: 16
 
   optim:
     optimizer:
       _target_: torch.optim.AdamW
       lr: 1e-3
-      weight_decay: 1e-3
+      weight_decay: 1e-4
 
     scheduler:
       _target_: torch.optim.lr_scheduler.CosineAnnealingLR
-      T_max: 650
+      T_max: 1000
       eta_min: 1e-6
 
     scheduler_cfg:
@@ -157,6 +164,6 @@ data:
 
   patch_size: [128, 128, 48]
   patches_per_subject: 2
-  patch_overlap: 0.25
-  spatial_augmentation_prob: 0.5
-  intensity_augmentation_prob: 0.5
+  patch_overlap: 0.5
+  spatial_augmentation_prob: 0.25
+  intensity_augmentation_prob: 0.25
