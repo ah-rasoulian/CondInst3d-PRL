@@ -12,6 +12,7 @@ class ImageInstancesData:
     """
     anchor_centers: Tensor               # [A, 3]
     anchor_strides: Tensor               # [A, 3]
+    level_strides: Tensor                # [A, 3]
 
     # train-time
     matched_idx: Optional[Tensor] = None # [A] in [-1..G-1]
@@ -26,6 +27,7 @@ class ImageInstancesData:
     def from_targets(
         cls,
         anchors: Tensor,               # [A,6]
+        level_strides: Tensor,         # [A,3]
         matched_idx: Tensor,           # [A]
         targets: Dict[str, Tensor],    # boxes [G,6], classes [G]
     ):
@@ -54,6 +56,7 @@ class ImageInstancesData:
         return cls(
             anchor_centers=centers,
             anchor_strides=strides,
+            level_strides=level_strides,
             matched_idx=matched_idx,
             gt_classes=gt_classes,
             gt_boxes=gt_boxes,
@@ -63,12 +66,13 @@ class ImageInstancesData:
     @classmethod
     def from_keep(
         cls,
-        anchors: Tensor,          # [A,6] OR you can pass centers/strides directly
+        anchors: Tensor,          # [A,6]
+        level_strides: Tensor,    # [A,3]
         keep_idxs: Tensor,        # [K]
     ):
         centers = (anchors[:, :3] + anchors[:, 3:]) / 2
         strides = anchors[:, 3:] - anchors[:, :3]
-        return cls(anchor_centers=centers, anchor_strides=strides, keep_idxs=keep_idxs)
+        return cls(anchor_centers=centers, anchor_strides=strides, level_strides=level_strides, keep_idxs=keep_idxs)
 
 
 class InstanceList:
@@ -81,7 +85,7 @@ class InstanceList:
 
         # build flat index of foreground (train) OR keep_idxs (infer)
         img_ids, anchor_ids, gt_ids = [], [], []
-        centers, strides = [], []
+        centers, strides, level_strides = [], [], []
 
         for img_i, d in enumerate(per_image):
             if d.keep_idxs is not None:
@@ -93,6 +97,7 @@ class InstanceList:
                 gt_ids.append(torch.full((aidx.numel(),), -1, device=aidx.device, dtype=torch.long))
                 centers.append(d.anchor_centers[aidx])
                 strides.append(d.anchor_strides[aidx])
+                level_strides.append(d.level_strides[aidx])
             else:
                 fg = d.fg_mask
                 aidx = torch.where(fg)[0]
@@ -102,6 +107,7 @@ class InstanceList:
                 gt_ids.append(d.matched_idx[aidx])  # index of GT instance in that image
                 centers.append(d.anchor_centers[aidx])
                 strides.append(d.anchor_strides[aidx])
+                level_strides.append(d.level_strides[aidx])
 
         if len(img_ids) == 0:
             self.img_idx = torch.empty((0,), device=self.device, dtype=torch.long)
@@ -109,12 +115,14 @@ class InstanceList:
             self.gt_idx = torch.empty((0,), device=self.device, dtype=torch.long)
             self.centers = torch.empty((0, 3), device=self.device)
             self.strides = torch.empty((0, 3), device=self.device)
+            self.level_strides = torch.empty((0, 3), device=self.device)
         else:
             self.img_idx = torch.cat(img_ids, dim=0)
             self.anchor_idx = torch.cat(anchor_ids, dim=0)
             self.gt_idx = torch.cat(gt_ids, dim=0)
             self.centers = torch.cat(centers, dim=0)
             self.strides = torch.cat(strides, dim=0)
+            self.level_strides = torch.cat(level_strides, dim=0)
 
         # sampling
         self.sample_idx = self._build_sample_idx(max_samples)
@@ -138,6 +146,9 @@ class InstanceList:
 
     def get_strides(self) -> Tensor:
         return self.strides[self.sample_idx]
+
+    def get_level_strides(self) -> Tensor:
+        return self.level_strides[self.sample_idx]
 
     def get_image_indices(self) -> Tensor:
         return self.img_idx[self.sample_idx]

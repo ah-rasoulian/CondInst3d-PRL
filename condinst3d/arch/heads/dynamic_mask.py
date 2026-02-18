@@ -129,7 +129,7 @@ class DynamicMaskHead(nn.Module):
         # flattened per-instance data
         im_inds = instance_list.get_image_indices()            # [M]
         inst_points = instance_list.get_points()               # [M, 3]
-        inst_strides = instance_list.get_strides()             # [M, 3]
+        inst_strides = instance_list.get_level_strides()             # [M, 3]
         mask_head_params = instance_list.gather_mask_head_params(controller_logits)  # [M, P]
 
         # size-of-interest scaling (broadcast safe)
