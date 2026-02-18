@@ -71,6 +71,7 @@ class CondInst3dPRL(pl.LightningModule):
         self.forward_chunk_size: int = cfg.forward_chunk_size
         self.max_mask_to_train: int = cfg.max_mask_to_train
         self.backbone: AbstractBackbone = instantiate(cfg.backbone)
+        self.head_level_strides = self.get_head_level_strides(cfg.backbone.strides, cfg.backbone.head_start_index)
 
         # --------------- anchor matching ----------------
         self.matcher = AnisotropicATSSMatcher(
@@ -138,6 +139,18 @@ class CondInst3dPRL(pl.LightningModule):
         self.images_to_visualize: Dict[int, List[int]] = {}
         self.num_images_to_show = int(cfg.visualization.num_images_to_show)
 
+    def get_head_level_strides(self, backbone_strides: Sequence[Sequence[int]], head_start_index: int) -> torch.Tensor:
+        stage = torch.tensor(backbone_strides, dtype=torch.float32)
+        cum = torch.cumprod(stage, dim=0)  # [S,3]
+        return cum[head_start_index:]
+
+    def expand_level_strides_to_anchors(self, anchors_per_level: List[torch.Tensor]) -> torch.Tensor:
+        assert len(anchors_per_level) == self.head_level_strides.shape[0]
+        per_level = []
+        for l, a in enumerate(anchors_per_level):
+            per_level.append(self.head_level_strides[l].view(1, 3).repeat(a.shape[0], 1))  # [Al,3]
+        return torch.cat(per_level, dim=0)  # [A,3]
+
     def _generate_metrics(self, eval_cfg: Dict):
         metrics = torchmetrics.MetricCollection({
                 "mask_cfm": DetectionConfusionMatrix(iou_thresholds=eval_cfg.iou_list),
@@ -194,6 +207,9 @@ class CondInst3dPRL(pl.LightningModule):
             spacing: Optional[Tensor] = None,
     ) -> List[ImageInstancesData]:
         anchors = torch.cat(anchors_per_level, dim=0)  # [A, 6]
+        level_strides = self.expand_level_strides_to_anchors(anchors_per_level)
+        level_strides = level_strides.to(anchors.device)
+
         A = anchors.size(0)
         device = anchors.device
         num_anchors_per_level = [a.size(0) for a in anchors_per_level]
@@ -216,6 +232,7 @@ class CondInst3dPRL(pl.LightningModule):
             # generate instance for image
             image_instance_data = ImageInstancesData.from_targets(
                 anchors=anchors,
+                level_strides=level_strides,
                 matched_idx=matched_idx,
                 targets=targets_per_image,
             )
@@ -272,7 +289,43 @@ class CondInst3dPRL(pl.LightningModule):
         num_pos = pos_mask.sum().to(loss_sum.dtype)
         loss_cls = loss_sum / torch.clamp(num_pos, min=1.0)
 
-        return loss_cls, instance_data_list
+        instance_list = InstanceList(instance_data_list, self.max_mask_to_train)
+
+        # ## dubeg # -------------------------------------------------------------
+        # # -------------------------------------------------------------
+        # # debug / matcher stats
+        # # -------------------------------------------------------------
+        # pos_per_img = pos_mask.sum(dim=1)  # [B]
+        # num_gt_per_img = torch.tensor([t["classes"].numel() for t in targets], device=device)  # [B]
+        # ratio = pos_per_img.float() / num_gt_per_img.clamp(min=1).float()
+        #
+        # # count GTs that got at least one matched positive (per image)
+        # matched_gt_per_img = torch.zeros((B,), device=device, dtype=torch.long)
+        #
+        # for b, d in enumerate(instance_data_list):
+        #     if d.matched_idx is None:
+        #         continue
+        #     m = d.matched_idx  # [A] in [-1..G-1]
+        #     sel = m >= 0
+        #     if sel.any():
+        #         matched_gt_per_img[b] = m[sel].unique().numel()
+        #
+        # unmatched_gt_per_img = (num_gt_per_img.to(torch.long) - matched_gt_per_img).clamp(min=0)
+        #
+        # # log means
+        # self.log("match/pos_per_img", pos_per_img.float().mean(), prog_bar=True)
+        # self.log("match/gt_per_img", num_gt_per_img.float().mean(), prog_bar=True)
+        # self.log("match/pos_per_gt", ratio.mean(), prog_bar=True)
+        #
+        # self.log("match/matched_gt_per_img", matched_gt_per_img.float().mean(), prog_bar=True)
+        # self.log("match/unmatched_gt_per_img", unmatched_gt_per_img.float().mean(), prog_bar=True)
+        #
+        # # optional: log fraction of GTs unmatched (more interpretable across batches)
+        # unmatched_frac = unmatched_gt_per_img.float() / num_gt_per_img.clamp(min=1).float()
+        # self.log("match/unmatched_gt_frac", unmatched_frac.mean(), prog_bar=True)
+        # # end of debug ---------------------------------------------------
+
+        return loss_cls, instance_list
 
     def _compute_segmentation_loss(
             self,
@@ -315,9 +368,7 @@ class CondInst3dPRL(pl.LightningModule):
         }
 
     def compute_loss(self, outputs, targets):
-        classification_loss, instance_data_list = self._compute_detection_loss(outputs, targets)
-
-        instance_list = InstanceList(instance_data_list, self.max_mask_to_train)
+        classification_loss, instance_list = self._compute_detection_loss(outputs, targets)
 
         outputs["instance_logits"] = self.instance_segmentation_head(
             outputs["f_mask"],
@@ -378,6 +429,8 @@ class CondInst3dPRL(pl.LightningModule):
         )  # [L]
 
         anchors_cat = torch.cat(anchors_per_level, dim=0)  # [A_total, 6]
+        level_strides = self.expand_level_strides_to_anchors(anchors_per_level)  # [A_total, 3]
+        level_strides = level_strides.to(anchors_cat.device)
 
         # ---- split logits by level (cheap view) ----
         logits_by_level = list(cls_logits.split(num_anchors_per_level, dim=1))  # L items of [N, A_l, C]
@@ -429,7 +482,7 @@ class CondInst3dPRL(pl.LightningModule):
                 empty_classes = torch.empty((0,), device=device, dtype=torch.long)
                 empty_keep = torch.empty((0,), device=device, dtype=torch.long)
 
-                inst = ImageInstancesData.from_keep(anchors=anchors_cat, keep_idxs=empty_keep)
+                inst = ImageInstancesData.from_keep(anchors=anchors_cat, level_strides=level_strides, keep_idxs=empty_keep)
                 per_image_instances.append(inst)
                 detections.append(
                     {
@@ -449,7 +502,7 @@ class CondInst3dPRL(pl.LightningModule):
             classes = torch.cat(img_classes_all, dim=0)  # [K_total]
 
             # build per-image instance data (stores centers/strides for all anchors + keep indices)
-            inst = ImageInstancesData.from_keep(anchors=anchors_cat, keep_idxs=keep_idxs)
+            inst = ImageInstancesData.from_keep(anchors=anchors_cat, level_strides=level_strides, keep_idxs=keep_idxs)
             per_image_instances.append(inst)
 
             # centers/strides for selected candidates (K_total,3)
@@ -656,11 +709,11 @@ class CondInst3dPRL(pl.LightningModule):
         }
         return outputs
 
-    def on_train_epoch_start(self):
-        dl = self.trainer.train_dataloader
-        sampler = getattr(dl, "sampler", None)
-        if sampler is not None and hasattr(sampler, "set_epoch"):
-            sampler.set_epoch(self.trainer.current_epoch)
+    # def on_train_epoch_start(self):
+    #     dl = self.trainer.train_dataloader
+    #     sampler = getattr(dl, "sampler", None)
+    #     if sampler is not None and hasattr(sampler, "set_epoch"):
+    #         sampler.set_epoch(self.trainer.current_epoch)
 
     # ---------------- Train / Val ----------------
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
@@ -688,6 +741,21 @@ class CondInst3dPRL(pl.LightningModule):
             batch_size=bs,
         )
 
+        # # debug
+        # inputs = batch.get("inputs", None)
+        # cases = batch.get("case", None)
+        # preds = self.predict_step(batch, batch_idx)
+        #
+        # # If inputs_full is missing, skip gracefully (still return preds)
+        # if inputs is not None:
+        #     self._visualize_batch(
+        #         inputs=inputs,
+        #         preds=preds,
+        #         targets=targets,
+        #         cases=cases,
+        #         prefix="train",
+        #     )
+
         return loss
 
     def on_validation_start(self) -> None:
@@ -695,7 +763,15 @@ class CondInst3dPRL(pl.LightningModule):
         if not getattr(self, "images_to_visualize", None):
             self._assign_images_to_visualize()
 
-    def validation_step(self, batch: dict, batch_idx: int) -> Any:
+    # def on_validation_epoch_start(self):
+    #     dl = self.trainer.val_dataloaders
+    #     if isinstance(dl, list):
+    #         dl = dl[0]
+    #     s = getattr(dl, "sampler", None)
+    #     if hasattr(s, "set_epoch"):
+    #         s.set_epoch(self.current_epoch)
+
+    def validation_step(self, batch: dict, batch_idx: int):
         targets = batch["targets"]  # list[dict]
         preds = self.predict_step(batch, batch_idx)
 
@@ -706,7 +782,7 @@ class CondInst3dPRL(pl.LightningModule):
             scores = det["scores"]  # [K]
 
             # --- masks ---
-            pred_onehot = _squeeze_onehot(det["onehot_instance_mask"])  # [K,H,W,D]
+            pred_onehot = _squeeze_onehot(det["onehot"])  # [K,H,W,D]
             gt_onehot = _squeeze_onehot(tgt["onehot"])  # [G,H,W,D]
 
             pairwise_mask_iou = mask_intersection_over_union(
@@ -723,31 +799,47 @@ class CondInst3dPRL(pl.LightningModule):
             metric_dict["box_cfm"].update(pairwise_box_iou)
             metric_dict["box_ap"].update(pairwise_box_iou, scores)
 
-        # -------- visualization gate --------
+        # -------- visualization gate (MAYBE logic stays here) --------
         vis_indices = set(self.images_to_visualize.get(0, []))
         do_vis = self.trainer.is_global_zero and (batch_idx in vis_indices)
-        if not do_vis:
-            return preds
+        if do_vis:
+            # Prefer full-volume input for plotting (no patch stitching)
+            inputs = batch.get("inputs_orig", batch.get("inputs", None))
+            cases = batch.get("case", None)
 
-        # Prefer full-volume input for plotting (no patch stitching)
-        inputs_full = batch.get("inputs_orig", batch.get("inputs", None))
-        cases = batch.get("case", None)
+            # If inputs_full is missing, skip gracefully (still return preds)
+            if inputs is not None:
+                self._visualize_batch(
+                    inputs=inputs,
+                    preds=preds,
+                    targets=targets,
+                    cases=cases,
+                    prefix="validation",
+                )
 
-        # If inputs_full is missing, skip gracefully (still return preds)
-        if inputs_full is None:
-            return preds
+        return preds
 
+    def _visualize_batch(
+            self,
+            *,
+            inputs: torch.Tensor,  # [B,C,H,W,D] (or whatever your visualizer expects per-sample)
+            preds: list[dict],
+            targets: list[dict],
+            cases=None,
+            prefix: str = "validation",
+    ) -> None:
+        """Pure visualization logic (no gating). Reusable from train/val."""
         for i, (det, tgt) in enumerate(zip(preds, targets)):
             semantic_gt = tgt["semantic_mask"]
-            img_to_show = torch.cat([inputs_full[i], semantic_gt], dim=0)
+            img_to_show = torch.cat([inputs[i], semantic_gt], dim=0)
 
-            scores = det["scores"]
+            scores = det.get("scores", None)
 
             gt_onehot = _squeeze_onehot(tgt["onehot"])
-            pred_onehot = _squeeze_onehot(det["onehot_instance_mask"])
+            pred_onehot = _squeeze_onehot(det["onehot"])
 
             y_true = onehot_to_instance_mask(gt_onehot)
-            y_pred = det["instance_mask"]
+            y_pred = onehot_to_instance_mask(pred_onehot)
 
             true_ids = torch.unique(y_true)
             true_ids = true_ids[true_ids > 0]
@@ -755,7 +847,12 @@ class CondInst3dPRL(pl.LightningModule):
             pred_ids = pred_ids[pred_ids > 0]
 
             pairwise_mask_iou = mask_intersection_over_union(pred_onehot, gt_onehot)
-            stats = get_stats(pairwise_mask_iou, y_true_ids=true_ids, y_pred_ids=pred_ids, scores=scores)
+            stats = get_stats(
+                pairwise_mask_iou,
+                y_true_ids=true_ids,
+                y_pred_ids=pred_ids,
+                scores=scores,
+            )
 
             title = str(cases[i]) if cases is not None else f"idx={i}"
 
@@ -772,14 +869,12 @@ class CondInst3dPRL(pl.LightningModule):
             )
 
             for t, fig in figs.items():
-                self._log_figure(f"Images-{title}/{t}", fig)
+                self._log_figure(f"{prefix}-Images-{title}/{t}", fig)
                 try:
                     import matplotlib.pyplot as plt
                     plt.close(fig)
                 except Exception:
                     pass
-
-        return preds
 
     # ---------------- Figure logging ----------------
     def _log_figure(self, name: str, fig, *, close: bool = True) -> None:
@@ -859,53 +954,48 @@ class CondInst3dPRL(pl.LightningModule):
                 self._log_scalar(f"{prefix}/AP@{th_str}", ap_i)
 
     def on_validation_epoch_end(self) -> None:
-        """
-        Single validation dataloader: log BOTH mask and box metrics.
-        Assumes self.metrics["validation"]["0"] contains:
-          - mask_cfm, mask_ap
-          - box_cfm, box_ap
-        with .compute(), .plot() and .reset().
-        """
         metric_dict = self.metrics["validation"]
 
-        # ---------------- Masks ----------------
-        mask_cfm: Tensor = metric_dict["mask_cfm"].compute()     # [T,3]
-        mask_ap: Tensor = metric_dict["mask_ap"].compute()       # [T] or [T,...]
-        mask_fig, _ = metric_dict["mask_ap"].plot()
+        # --- compute on all ranks (or whatever your metric expects) ---
+        mask_cfm: Tensor = metric_dict["mask_cfm"].compute()
+        mask_ap: Tensor = metric_dict["mask_ap"].compute()
 
-        self._log_figure("Validation/Masks/PR-curve", mask_fig, close=True)
+        box_cfm: Tensor = metric_dict["box_cfm"].compute()
+        box_ap: Tensor = metric_dict["box_ap"].compute()
+
+        # --- scalar logs: all ranks call these, same keys/order ---
         self._log_scalar("Validation/Masks/mAP", _safe_mean(mask_ap))
+        self._log_scalar("Validation/Boxes/mAP", _safe_mean(box_ap))
 
-        mask_thresholds = metric_dict["mask_cfm"].iou_thresholds
         self._log_cfm_series(
             prefix="Validation/Masks-IoU",
             cfm=mask_cfm,
-            iou_thresholds=mask_thresholds,
-            ap_per_thr=mask_ap if mask_ap.numel() else None,
+            iou_thresholds=metric_dict["mask_cfm"].iou_thresholds,
+            ap_per_thr=mask_ap if isinstance(mask_ap, Tensor) and mask_ap.numel() else None,
         )
-
-        # ---------------- Boxes ----------------
-        box_cfm: Tensor = metric_dict["box_cfm"].compute()       # [T,3]
-        box_ap: Tensor = metric_dict["box_ap"].compute()         # [T] or [T,...]
-        box_fig, _ = metric_dict["box_ap"].plot()
-
-        self._log_figure("Validation/Boxes/PR-curve", box_fig, close=True)
-        self._log_scalar("Validation/Boxes/mAP", _safe_mean(box_ap))
-
-        box_thresholds = metric_dict["box_cfm"].iou_thresholds
         self._log_cfm_series(
             prefix="Validation/Boxes-IoU",
             cfm=box_cfm,
-            iou_thresholds=box_thresholds,
-            ap_per_thr=box_ap if box_ap.numel() else None,
+            iou_thresholds=metric_dict["box_cfm"].iou_thresholds,
+            ap_per_thr=box_ap if isinstance(box_ap, Tensor) and box_ap.numel() else None,
         )
 
-        # ---------------- reset once ----------------
+        # --- plots: rank0 only (IMPORTANT) ---
+        if self.trainer.is_global_zero:
+            mask_fig, _ = metric_dict["mask_ap"].plot()
+            self._log_figure("Validation/Masks/PR-curve", mask_fig, close=True)
+
+            box_fig, _ = metric_dict["box_ap"].plot()
+            self._log_figure("Validation/Boxes/PR-curve", box_fig, close=True)
+
         metric_dict.reset()
 
     def predict_step(self, batch: dict, batch_idx, dataloader_idx=0) -> Any:
         inputs = batch["inputs"]
-        output_shape = batch["inputs_orig"].shape[-3:]
+        output_shape = batch.get("inputs_orig", inputs).shape[-3:]
+
+        if inputs.ndim == 5:
+            inputs = inputs.unsqueeze(1)
         det = self.compute_detections_and_segmentations(inputs)
         # det = self.postprocess(det)
 
