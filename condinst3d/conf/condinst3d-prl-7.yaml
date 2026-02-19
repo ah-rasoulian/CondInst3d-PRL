@@ -36,7 +36,7 @@ train:
 
   trainer:
     accelerator: gpu
-    devices: [0]
+    devices: [2]
     precision: bf16-mixed
     max_epochs: 30
     gradient_clip_algorithm: norm
@@ -70,8 +70,7 @@ model:
     num_candidates: 25
     min_pos: 3
     center_in_gt: true
-    anchors_sizes: [ [ 4,4,2 ], [ 8,8,4 ], [ 16,16,8 ], [ 32, 32, 8 ] ]
-#    anchors_sizes: [ [ 8,8,4 ], [ 16,16,8 ], [ 32,32,16 ], [ 48, 48, 16 ] ]
+    anchors_sizes: [ [ 6,6,4 ], [ 12,12,8 ], [ 24,24,12 ], [ 48, 48, 16 ] ]
 
   heads:
     classification:

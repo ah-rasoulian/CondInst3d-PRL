@@ -36,9 +36,9 @@ train:
 
   trainer:
     accelerator: gpu
-    devices: [0]
+    devices: [0,1,2,3]
     precision: bf16-mixed
-    max_epochs: 30
+    max_epochs: 1000
     gradient_clip_algorithm: norm
     gradient_clip_val: 0.5
     accumulate_grad_batches: 2
@@ -70,8 +70,7 @@ model:
     num_candidates: 25
     min_pos: 3
     center_in_gt: true
-    anchors_sizes: [ [ 4,4,2 ], [ 8,8,4 ], [ 16,16,8 ], [ 32, 32, 8 ] ]
-#    anchors_sizes: [ [ 8,8,4 ], [ 16,16,8 ], [ 32,32,16 ], [ 48, 48, 16 ] ]
+    anchors_sizes: [ [ 6,6,4 ], [ 12,12,8 ], [ 24,24,16 ], [ 48, 48, 16 ] ]
 
   heads:
     classification:
@@ -132,7 +131,7 @@ model:
     crop_size: [96, 96]
     show_slices: [-1, 0, 1]
     figsize: 1.5
-    num_images_to_show: 16
+    num_images_to_show: 24
 
   optim:
     optimizer:
@@ -167,7 +166,7 @@ data:
   empty_case_weight: 0.2
   instance_weight_power: 0.7
 
-  patch_size: [128, 128, 48]
+  patch_size: [128, 192, 56]
   patches_per_subject: 2
   patch_overlap: 0.5
   spatial_augmentation_prob: 0.25

@@ -194,7 +194,7 @@ def setup_trainer(cfg: DictConfig, logger, callbacks) -> Trainer:
 
 
 # -------------------- main --------------------
-@hydra.main(config_path="../condinst3d/conf", config_name="condinst3d-prl", version_base=None)
+@hydra.main(config_path="../condinst3d/conf", config_name="condinst3d-prl-best", version_base=None)
 def main(cfg: DictConfig) -> None:
     # global setup from cfg.train
     _maybe_set_rlimit_nofile(int(getattr(cfg.train, "rlimit_nofile", 1048576)))
