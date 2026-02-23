@@ -129,16 +129,24 @@ def setup_callbacks(cfg: DictConfig) -> List[Any]:
         return [instantiate(c) for c in _as_list(callbacks_cfg)]
 
     # sane defaults
-    ckpt = ModelCheckpoint(
-        monitor=str(getattr(cfg.train, "monitor", "Validation/Masks-IoU/Recall@0.01")),
+    best_ckpt = ModelCheckpoint(
+        monitor=str(getattr(cfg.train, "monitor", "Validation/Masks/mAP")),
         mode=str(getattr(cfg.train, "monitor_mode", "max")),
-        save_top_k=int(getattr(cfg.train, "save_top_k", 5)),
+        save_top_k=int(getattr(cfg.train, "save_top_k", 3)),
         filename=str(getattr(cfg.train, "ckpt_filename", "best_{epoch}-{step}")),
-        save_last=bool(getattr(cfg.train, "save_last", True)),
-        every_n_epochs=int(getattr(cfg.train, "ckpt_every_n_epochs", 1)),
+        save_last=False,
     )
+
+    last_ckpt = ModelCheckpoint(
+        save_top_k=0,
+        save_last=True,
+        filename="step_{epoch}-{step}",
+        every_n_train_steps=1000,
+        save_on_train_epoch_end=True,
+    )
+
     lr_monitor = LearningRateMonitor(logging_interval=str(getattr(cfg.train, "lr_logging_interval", "step")))
-    return [ckpt, lr_monitor]
+    return [best_ckpt, last_ckpt, lr_monitor]
 
 
 # -------------------- trainer/strategy --------------------
@@ -152,7 +160,7 @@ def setup_strategy(cfg: DictConfig):
     # else: default DDP strategy
     return DDPStrategy(
         process_group_backend=str(getattr(cfg.train, "ddp_backend", "nccl")),
-        find_unused_parameters=bool(getattr(cfg.train, "find_unused_parameters", True)),
+        find_unused_parameters=bool(getattr(cfg.train, "find_unused_parameters", False)),
     )
 
 
@@ -194,7 +202,7 @@ def setup_trainer(cfg: DictConfig, logger, callbacks) -> Trainer:
 
 
 # -------------------- main --------------------
-@hydra.main(config_path="../condinst3d/conf", config_name="condinst3d-prl-best", version_base=None)
+@hydra.main(config_path="../condinst3d/conf", config_name="condinst3d-prl-final", version_base=None)
 def main(cfg: DictConfig) -> None:
     # global setup from cfg.train
     _maybe_set_rlimit_nofile(int(getattr(cfg.train, "rlimit_nofile", 1048576)))
