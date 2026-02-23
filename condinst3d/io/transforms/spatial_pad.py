@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Hashable, Sequence, Tuple, Union
+
+import numpy as np
 import torch
 from monai.transforms import MapTransform
 from monai.config import KeysCollection
@@ -153,5 +155,6 @@ class SymmetricGridPad(MapTransform):
             pad = (pz0, pz1, py0, py1, px0, px1)  # torch pad order for 3D
 
             d[k] = torch.nn.functional.pad(x, pad, mode="constant", value=0)
+            d[f"{k}_pad"] = np.array([px0, px1, py0, py1, pz0, pz1])
 
         return d
