@@ -1,109 +1,159 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Iterable
 import torch
 import os
 import hydra
-from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.loggers import TensorBoardLogger
 import pytorch_lightning as pl
 from condinst3d.io.datamodule.prl import PRLDataModule
 from condinst3d.arch.condinst3d_prl import CondInst3dPRL
+import optuna
+import re
+import json
+from pytorch_lightning.callbacks import TQDMProgressBar
 
 
-def setup_logger(
-    save_dir: str = "logs",
-    name: str = "tb",
-    version: Optional[str] = None,
-    iou_thresholds: Optional[Iterable[float]] = None,
-    add_custom_scalars: bool = True,
-) -> TensorBoardLogger:
-    """
-    Create a default TensorBoardLogger with optional custom scalar layouts.
+try:
+    import resource  # Unix only
+except Exception:
+    resource = None
 
-    Args:
-        save_dir: Root directory for logs
-        name: Experiment name
-        version: Logger version (None = auto)
-        iou_thresholds: IoU thresholds for custom scalar layout
-                        (e.g. [0.5, 0.4, 0.3])
-        add_custom_scalars: Whether to register TensorBoard custom scalars
 
-    Returns:
-        TensorBoardLogger
-    """
+# -------------------- utils --------------------
+def _maybe_set_rlimit_nofile(limit: int) -> None:
+    if resource is None:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(limit, hard), hard))
+    except Exception:
+        pass
 
-    logger = TensorBoardLogger(
-        save_dir=save_dir,
-        name=name,
-        version=version,
-        default_hp_metric=False,
-    )
 
-    if add_custom_scalars and iou_thresholds:
-        iou_list = [float(x) for x in iou_thresholds]
+def _seed_everything(seed: int, deterministic: bool = False) -> None:
+    pl.seed_everything(seed, workers=True)
+    # torch matmul perf/precision
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
-        layout = {
-            "Masks-IoU": {
-                "TP": ["Multiline", [f"Masks-IoU/TP@{th:.2f}" for th in iou_list]],
-                "FP": ["Multiline", [f"Masks-IoU/FP@{th:.2f}" for th in iou_list]],
-                "FN": ["Multiline", [f"Masks-IoU/FN@{th:.2f}" for th in iou_list]],
-                "Precision": ["Multiline", [f"Masks-IoU/Precision@{th:.2f}" for th in iou_list]],
-                "Recall": ["Multiline", [f"Masks-IoU/Recall@{th:.2f}" for th in iou_list]],
-                "F1": ["Multiline", [f"Masks-IoU/F1@{th:.2f}" for th in iou_list]],
-                "AP": ["Multiline", [f"Masks-IoU/AP@{th:.2f}" for th in iou_list]],
-            },
-            "Boxes-IoU": {
-                "TP": ["Multiline", [f"Boxes-IoU/TP@{th:.2f}" for th in iou_list]],
-                "FP": ["Multiline", [f"Boxes-IoU/FP@{th:.2f}" for th in iou_list]],
-                "FN": ["Multiline", [f"Boxes-IoU/FN@{th:.2f}" for th in iou_list]],
-                "Precision": ["Multiline", [f"Boxes-IoU/Precision@{th:.2f}" for th in iou_list]],
-                "Recall": ["Multiline", [f"Boxes-IoU/Recall@{th:.2f}" for th in iou_list]],
-                "F1": ["Multiline", [f"Boxes-IoU/F1@{th:.2f}" for th in iou_list]],
-                "AP": ["Multiline", [f"Boxes-IoU/AP@{th:.2f}" for th in iou_list]],
-            },
+    # optional MONAI determinism
+    if deterministic:
+        try:
+            from monai.utils import set_determinism
+            set_determinism(seed=seed)
+        except Exception:
+            pass
+
+
+def get_json_path(checkpoint_path: str, suffix=""):
+    optimum_param_dir = os.path.dirname(checkpoint_path).replace("checkpoint", "hyperparam")
+    os.makedirs(optimum_param_dir, exist_ok=True)
+
+    pattern = r"version_([\d-]+).*?epoch=(\d+)"
+    match = re.search(pattern, checkpoint_path)
+
+    if match is None:
+        base = os.path.splitext(os.path.basename(checkpoint_path))[0]
+        version_name = f"validation_{base}{suffix}.json"
+    else:
+        version_name = f"validation_version_{match.group(1)}-epoch={match.group(2)}{suffix}.json"
+
+    optimum_param_path = os.path.join(optimum_param_dir, version_name)
+    i = 1
+    while os.path.isfile(optimum_param_path):
+        root, ext = os.path.splitext(version_name)
+        optimum_param_path = os.path.join(optimum_param_dir, f"{root}_{i}{ext}")
+        i += 1
+    return optimum_param_path
+
+
+class HyperParamOptimizer:
+    def __init__(self, cfg: DictConfig, ckpt_path: str):
+        self.cfg = cfg
+        self.dm = PRLDataModule(cfg.data)
+        self.ckpt_path = ckpt_path
+
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        model = CondInst3dPRL(cfg=cfg.model)
+        model.load_state_dict(ckpt["state_dict"], strict=True)
+        self.model = model
+
+        # Make validate fast + deterministic-ish
+        self.trainer = pl.Trainer(
+            accelerator="gpu",
+            devices=[0, 1, 2, 3],
+            logger=False,
+            enable_checkpointing=False,
+            enable_progress_bar=True,
+            callbacks=[TQDMProgressBar(refresh_rate=20)],
+        )
+
+        self.metric_key = "Validation/Masks/mAP"  # change if needed
+
+    def objective_function(self, trial: optuna.Trial):
+        # IMPORTANT: reseed so every trial sees the same validation randomness/order
+        # (still better: remove randomness from val transforms entirely)
+        seed = int(getattr(self.cfg.train, "seed", 1000))
+        pl.seed_everything(seed, workers=True)
+
+        params = {
+            "mask_thresh": trial.suggest_float("mask_thresh", 0.4, 0.6),
+            "score_thresh": trial.suggest_float("score_thresh", 0.4, 0.7),
+            "nms_thresh": trial.suggest_float("nms_thresh", 0.1, 0.9),
+            "group_thresh": trial.suggest_float("group_thresh", 0.1, 0.9),
+            "topk_candidates": trial.suggest_int("topk_candidates", 5, 25),
         }
+        self.model.inference_hyperparams = params
 
-        logger.experiment.add_custom_scalars(layout)
+        patch_overlap = trial.suggest_float("patch_overlap", 0.2, 0.6)
+        self.dm.patch_overlap = patch_overlap
+        self.dm.setup("validate")
 
-    return logger
+        with torch.inference_mode():
+            val_metrics = self.trainer.validate(self.model, datamodule=self.dm, verbose=False)
+
+        if not val_metrics or self.metric_key not in val_metrics[0]:
+            raise KeyError(
+                f"Metric '{self.metric_key}' not found. Got keys: {list(val_metrics[0].keys()) if val_metrics else val_metrics}"
+            )
+
+        metric = float(val_metrics[0][self.metric_key])
+        return metric
+
+    def find_optimum(self, n_trials: int):
+        sampler = optuna.samplers.TPESampler(seed=int(getattr(self.cfg.train, "seed", 1000)))
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+        study.optimize(self.objective_function, n_trials=n_trials)
+
+        optimum_param_path = get_json_path(self.ckpt_path, suffix="det-params")
+        optimum_params = dict(study.best_params)
+        optimum_params["best_val"] = float(study.best_value)
+
+        with open(optimum_param_path, "w") as f:
+            json.dump(optimum_params, f, indent=4)
+
+        return optimum_params
 
 
 # -------------------- main --------------------
-@hydra.main(config_path="../condinst3d/conf", config_name="condinst3d-prl", version_base=None)
+@hydra.main(config_path="../condinst3d/conf", config_name="condinst3d-prl-final", version_base=None)
 def main(cfg: DictConfig) -> None:
-    # instantiate model/datamodule from config
-    ckpt_path = "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/2026-02-07/08-04-57/tb/version_0/checkpoints/last.ckpt"
-    model = CondInst3dPRL.load_from_checkpoint(ckpt_path, cfg=cfg.model)
-
-    model.inference_hyperparams = {
-        "mask_thresh": 0.4,
-        "score_thresh": 0.4,
-        "nms_thresh": 0.5,
-        "group_thresh": 0.5,
-        "topk_candidates": 15,
-    }
-    dm = PRLDataModule(cfg.data)
-
-    logger = setup_logger()
-
-    trainer = pl.Trainer(
-        accelerator="gpu",
-        precision="bf16-mixed",
-        devices=[0],
-        logger=logger,
-
-        num_sanity_val_steps=0,
-        enable_checkpointing=False,
-        enable_progress_bar=True,
-        log_every_n_steps=1,
-
-        inference_mode=True,
-        deterministic=True,
+    # global setup from cfg.train
+    _maybe_set_rlimit_nofile(int(getattr(cfg.train, "rlimit_nofile", 1048576)))
+    _seed_everything(
+        seed=int(getattr(cfg.train, "seed", 1000)),
+        deterministic=bool(getattr(cfg.train, "deterministic", False)),
     )
-    trainer.validate(model=model, datamodule=dm)
+
+    ckpt_path = "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/condinst3d-prl-final/2026-02-21_00-58-25/tb/version_0/checkpoints/best_epoch=309-step=29450.ckpt"
+    optimum_finder = HyperParamOptimizer(cfg=cfg, ckpt_path=ckpt_path)
+
+    best_params = optimum_finder.find_optimum(100)
+    print(f"Best val inference result:")
+    print(best_params)
 
 
 if __name__ == "__main__":
