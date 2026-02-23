@@ -8,7 +8,7 @@ train:
   seed: 1000
   deterministic: false
   rlimit_nofile: 1048576
-  resume: "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/condinst3d-prl-8/2026-02-19_17-37-02/tb/version_0/checkpoints/last.ckpt"
+  resume: null
 
   logger:
     _target_: pytorch_lightning.loggers.TensorBoardLogger
@@ -36,15 +36,14 @@ train:
 
   trainer:
     accelerator: gpu
-    devices: [3]
-    precision: bf16-mixed
+    devices: [0, 1, 2, 3]
     max_epochs: 1000
     gradient_clip_algorithm: norm
     gradient_clip_val: 0.5
-    accumulate_grad_batches: 2
+    accumulate_grad_batches: 1
     num_sanity_val_steps: 5
-    check_val_every_n_epoch: 10
-    log_every_n_steps: 10
+    check_val_every_n_epoch: 5
+    log_every_n_steps: 1
     limit_train_batches: 1.0
     limit_val_batches: 1.0
     enable_progress_bar: true
@@ -131,18 +130,26 @@ model:
     crop_size: [96, 96]
     show_slices: [-1, 0, 1]
     figsize: 1.5
-    num_images_to_show: 16
+    num_images_to_show: 24
 
   optim:
     optimizer:
-      _target_: torch.optim.AdamW
-      lr: 1e-3
+      _target_: torch.optim.SGD
+      lr: 0.03
+      momentum: 0.9
       weight_decay: 1e-4
+      nesterov: true
 
     scheduler:
-      _target_: torch.optim.lr_scheduler.CosineAnnealingLR
-      T_max: 1000
-      eta_min: 1e-6
+      _target_: torch.optim.lr_scheduler.SequentialLR
+      schedulers:
+        - _target_: torch.optim.lr_scheduler.LinearLR
+          start_factor: 0.1
+          total_iters: 10         # warmup epochs
+        - _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+          T_max: 990              # remaining epochs (1000 - 10)
+          eta_min: 1e-5
+      milestones: [ 10 ]
 
     scheduler_cfg:
       interval: epoch
@@ -155,8 +162,8 @@ data:
   modalities: ['t1w', 't2w', 'flr', 'freqmap']
   splits_path: "/scratch/04/public_datasets/nnDet/Task100_PRL/preprocessed/splits_final.pkl"
   num_workers:
-    train: 24
-    val: 24
+    train: 8
+    val: 8
     test: 1
   batch_size:
     train: 2

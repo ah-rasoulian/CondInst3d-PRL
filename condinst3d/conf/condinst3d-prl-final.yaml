@@ -8,7 +8,7 @@ train:
   seed: 1000
   deterministic: false
   rlimit_nofile: 1048576
-  resume: "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/condinst3d-prl-8/2026-02-19_17-37-02/tb/version_0/checkpoints/last.ckpt"
+  resume: "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/condinst3d-prl-final/2026-02-21_00-58-25/tb/version_0/checkpoints/last.ckpt"
 
   logger:
     _target_: pytorch_lightning.loggers.TensorBoardLogger
@@ -32,16 +32,14 @@ train:
 
   # DDP defaults (used if train.strategy not provided)
   ddp_backend: "nccl"
-  find_unused_parameters: true
 
   trainer:
     accelerator: gpu
-    devices: [3]
-    precision: bf16-mixed
+    devices: [0, 1, 2, 3]
     max_epochs: 1000
     gradient_clip_algorithm: norm
     gradient_clip_val: 0.5
-    accumulate_grad_batches: 2
+    accumulate_grad_batches: 1
     num_sanity_val_steps: 5
     check_val_every_n_epoch: 10
     log_every_n_steps: 10
@@ -51,8 +49,9 @@ train:
     enable_model_summary: true
 
 model:
+  output_dir: "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/condinst3d-prl-final/2026-02-21_00-58-25/tb/version_0/test_outputs"
   forward_chunk_size: 16
-  max_mask_to_train: 384
+  max_mask_to_train: 512
 
   backbone:
     _target_: condinst3d.arch.backbone.unetr_specific_mod.UNetRSpecificMod
@@ -67,15 +66,16 @@ model:
     out_channels: 8
 
   matcher:
-    num_candidates: 25
-    min_pos: 3
+    num_candidates: 35
+    min_pos: 5
+    threshold_strategy: "mean"
     center_in_gt: true
     anchors_sizes: [ [ 6,6,4 ], [ 12,12,8 ], [ 24,24,16 ], [ 48, 48, 16 ] ]
 
   heads:
     classification:
       num_classes: 1
-      prior_probability: 0.01
+      prior_probability: 0.02
 
     instance_segmentation:
       channels: 8
@@ -96,28 +96,22 @@ model:
       reduction: "none"
 
     instance_segmentation:
-      _target_: monai.losses.DiceFocalLoss
+      _target_: monai.losses.DiceCELoss
       to_onehot_y: false
       sigmoid: true
-      gamma: 2.0
-      lambda_dice: 1.0
-      lambda_focal: 1.0
       reduction: "mean"
 
     semantic_segmentation:
-      _target_: monai.losses.DiceFocalLoss
-      include_background: false
+      _target_: monai.losses.DiceCELoss
       to_onehot_y: true
       softmax: true
-      gamma: 2.0
-      lambda_dice: 1.0
-      lambda_focal: 1.0
+      include_background: false
       reduction: "mean"
 
   inference:
     mask_thresh: 0.5
-    score_thresh: 0.5
-    nms_thresh: 0.5
+    score_thresh: 0.4
+    nms_thresh: 0.25
     group_thresh: 0.5
     topk_candidates: 20
 
@@ -136,13 +130,24 @@ model:
   optim:
     optimizer:
       _target_: torch.optim.AdamW
-      lr: 1e-3
-      weight_decay: 1e-4
+      lr: 3e-4
+      weight_decay: 5e-5
+      betas: [ 0.9, 0.999 ]
 
     scheduler:
-      _target_: torch.optim.lr_scheduler.CosineAnnealingLR
-      T_max: 1000
-      eta_min: 1e-6
+      _target_: torch.optim.lr_scheduler.SequentialLR
+      schedulers:
+        # ---- Warmup ----
+        - _target_: torch.optim.lr_scheduler.LinearLR
+          start_factor: 0.1     # start at 10% of base lr
+          total_iters: 10        # 10 epochs warmup
+
+        # ---- Cosine decay ----
+        - _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+          T_max: 990            # 1000 - 5
+          eta_min: 1e-6         # important for late AP polishing
+
+      milestones: [ 10 ]
 
     scheduler_cfg:
       interval: epoch
@@ -155,9 +160,9 @@ data:
   modalities: ['t1w', 't2w', 'flr', 'freqmap']
   splits_path: "/scratch/04/public_datasets/nnDet/Task100_PRL/preprocessed/splits_final.pkl"
   num_workers:
-    train: 24
-    val: 24
-    test: 1
+    train: 12
+    val: 12
+    test: 12
   batch_size:
     train: 2
     val: 1
@@ -166,8 +171,8 @@ data:
   empty_case_weight: 0.2
   instance_weight_power: 0.7
 
-  patch_size: [128, 128, 48]
-  patches_per_subject: 2
+  patch_size: [96, 96, 48]
+  patches_per_subject: 4
   patch_overlap: 0.5
   spatial_augmentation_prob: 0.25
   intensity_augmentation_prob: 0.25

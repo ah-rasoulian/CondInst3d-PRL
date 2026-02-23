@@ -8,7 +8,8 @@ train:
   seed: 1000
   deterministic: false
   rlimit_nofile: 1048576
-  resume: null
+  resume: "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/condinst3d-prl-spunetr/2026-02-19_20-00-01/tb/version_0/checkpoints/last.ckpt"
+  finetune: true
 
   logger:
     _target_: pytorch_lightning.loggers.TensorBoardLogger
@@ -36,15 +37,14 @@ train:
 
   trainer:
     accelerator: gpu
-    devices: [0,1,2,3]
-    precision: bf16-mixed
+    devices: [0, 1, 2, 3]
     max_epochs: 1000
     gradient_clip_algorithm: norm
     gradient_clip_val: 0.5
-    accumulate_grad_batches: 2
+    accumulate_grad_batches: 1
     num_sanity_val_steps: 5
-    check_val_every_n_epoch: 10
-    log_every_n_steps: 10
+    check_val_every_n_epoch: 5
+    log_every_n_steps: 1
     limit_train_batches: 1.0
     limit_val_batches: 1.0
     enable_progress_bar: true
@@ -67,7 +67,7 @@ model:
     out_channels: 8
 
   matcher:
-    num_candidates: 25
+    num_candidates: 30
     min_pos: 3
     center_in_gt: true
     anchors_sizes: [ [ 6,6,4 ], [ 12,12,8 ], [ 24,24,16 ], [ 48, 48, 16 ] ]
@@ -136,18 +136,8 @@ model:
   optim:
     optimizer:
       _target_: torch.optim.AdamW
-      lr: 1e-3
+      lr: 1e-4
       weight_decay: 1e-4
-
-    scheduler:
-      _target_: torch.optim.lr_scheduler.CosineAnnealingLR
-      T_max: 1000
-      eta_min: 1e-6
-
-    scheduler_cfg:
-      interval: epoch
-      frequency: 1
-      name: lr
 
 data:
   root_path: "/scratch/04/public_datasets/nnDet/Task100_PRL"
@@ -155,8 +145,8 @@ data:
   modalities: ['t1w', 't2w', 'flr', 'freqmap']
   splits_path: "/scratch/04/public_datasets/nnDet/Task100_PRL/preprocessed/splits_final.pkl"
   num_workers:
-    train: 24
-    val: 24
+    train: 8
+    val: 8
     test: 1
   batch_size:
     train: 2
@@ -166,7 +156,7 @@ data:
   empty_case_weight: 0.2
   instance_weight_power: 0.7
 
-  patch_size: [128, 192, 56]
+  patch_size: [128, 128, 48]
   patches_per_subject: 2
   patch_overlap: 0.5
   spatial_augmentation_prob: 0.25
