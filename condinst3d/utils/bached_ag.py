@@ -1,34 +1,77 @@
 from typing import Literal, Dict, Optional, Callable, List, Tuple
 import torch
 from torch import Tensor
-from condinst3d.evaluator.iou import box_intersection_over_union, box_intersection_over_minimum
-from monai.transforms.utils import get_unique_labels
-from condinst3d.utils.mask import relabel_sequential
+from condinst3d.evaluator.iou import (box_intersection_over_union, box_intersection_over_minimum,
+                                      mask_intersection_over_union, mask_intersection_over_minimum)
+import math
+
+
+def _encode_xyz_to_key(xyz: Tensor, shape_xyz: Tuple[int, int, int]) -> Tensor:
+    """
+    xyz: [P,3] int64 (x,y,z) in the same axis order as output_shape.
+    returns: [P] int64 keys
+    """
+    X, Y, Z = shape_xyz
+    return xyz[:, 0] + X * (xyz[:, 1] + Y * xyz[:, 2])
+
+
+def _decode_key_to_xyz(keys: Tensor, shape_xyz: Tuple[int, int, int]) -> Tensor:
+    """
+    keys: [P] int64
+    returns xyz: [P,3] int64 (x,y,z)
+    """
+    X, Y, Z = shape_xyz
+    z = keys // (X * Y)
+    rem = keys - z * (X * Y)
+    y = rem // X
+    x = rem - y * X
+    return torch.stack([x, y, z], dim=1)
+
+
+def _intersect_count_sorted(a: Tensor, b: Tensor) -> int:
+    """
+    Count intersection size of two sorted 1D int64 tensors (two-pointer).
+    """
+    i = j = 0
+    na = a.numel()
+    nb = b.numel()
+    cnt = 0
+    while i < na and j < nb:
+        av = int(a[i].item())
+        bv = int(b[j].item())
+        if av == bv:
+            cnt += 1
+            i += 1
+            j += 1
+        elif av < bv:
+            i += 1
+        else:
+            j += 1
+    return cnt
 
 
 class _UnionFind:
     def __init__(self, n: int):
-        self.parent = list(range(n))
-        self.rank = [0] * n
+        self.p = list(range(n))
+        self.r = [0] * n
 
-    def find(self, x: int) -> int:
-        while self.parent[x] != x:
-            self.parent[x] = self.parent[self.parent[x]]
-            x = self.parent[x]
-        return x
+    def find(self, a: int) -> int:
+        while self.p[a] != a:
+            self.p[a] = self.p[self.p[a]]
+            a = self.p[a]
+        return a
 
     def union(self, a: int, b: int) -> None:
         ra, rb = self.find(a), self.find(b)
         if ra == rb:
             return
-        if self.rank[ra] < self.rank[rb]:
-            self.parent[ra] = rb
-        elif self.rank[ra] > self.rank[rb]:
-            self.parent[rb] = ra
+        if self.r[ra] < self.r[rb]:
+            self.p[ra] = rb
+        elif self.r[ra] > self.r[rb]:
+            self.p[rb] = ra
         else:
-            self.parent[rb] = ra
-            self.rank[ra] += 1
-
+            self.p[rb] = ra
+            self.r[ra] += 1
 
 
 def batched_nms(
@@ -37,20 +80,33 @@ def batched_nms(
     threshold: float,
     classes: Optional[Tensor] = None,
     metric: Callable | Literal["iou", "iom"] = "iou",
+    device: str | None = None,
 ) -> Tensor:
     assert 0.0 <= threshold < 1.0
     if preds.numel() == 0:
         return torch.empty((0,), device=scores.device, dtype=torch.long)
 
+    if device is not None:
+        preds = preds.to(device)
+        scores = scores.to(device)
+        if classes is not None:
+            classes = classes.to(device)
+
     # pairwise metric
-    if callable(metric):
+    if isinstance(metric, Callable):
         pairwise = metric(preds, preds)
     else:
-        # boxes only here (your call site uses boxes)
-        if metric == "iou":
-            pairwise = box_intersection_over_union(preds, preds)
+        if preds.dim() == 2:
+            if metric == "iou":
+                pairwise = box_intersection_over_union(preds, preds)
+            else:
+                pairwise = box_intersection_over_minimum(preds, preds)
         else:
-            pairwise = box_intersection_over_minimum(preds, preds)
+            preds = preds.squeeze(1) if preds.dim() == 5 else preds  # N, C, W, H, D
+            if metric == "iou":
+                pairwise = mask_intersection_over_union(preds, preds)
+            else:
+                pairwise = mask_intersection_over_minimum(preds, preds)
 
     order = scores.argsort(descending=True)
     keep = []
@@ -75,240 +131,140 @@ def batched_nms(
 
     return torch.stack(keep).to(dtype=torch.long)
 
-
-def aggregate_per_patch_detections(
-    x: Dict[str, List[Tensor]],
-    iou_thr: float,
-    mask_thr: float,  # <-- probability threshold in [0,1]
-    output_shape: Tuple[int, int, int],
-) -> Dict[str, Tensor]:
+def merge_prediction(
+        det: Dict[str, Tensor],
+        output_shape: Tuple[int, int, int],
+        group_thresh: float,
+    ) -> Dict[str, Tensor]:
     """
-    Aggregates per-patch detections into per-image detections.
+            Per-image merge logic:
+              - Group detections if:
+                  (1) ||c_i - c_j|| < 0.5 * (||s_i|| + ||s_j||)
+                  (2) IoM(mask_i, mask_j) > group_thresh, IoM = inter / min(|A|,|B|)
+              - Merge each group by union of masks in original image space
+              - Set center/stride to group average
+            Returns a per-image dict with:
+              onehot: [G,1,X,Y,Z] bool  (global/original image space)
+              offset: [G,3] zeros
+            """
+    X, Y, Z = output_shape
+    device = det["onehot"].device
 
-    Inputs (per image):
-      - x["bboxes"][p]         : [Kp,6] patch-local boxes (x1,y1,z1,x2,y2,z2)
-      - x["scores"][p]         : [Kp]
-      - x["onehot_logits"][p]  : [Kp,1,ph,pw,pd] logits in patch space
-      - x["offset"][p]         : [3] patch origin in global space (ox,oy,oz)
-      - x["anchor_centers"][p] : [Kp,3] patch-local centers
-      - x["anchor_strides"][p] : [Kp,3]
+    anchor_centers = det["anchor_centers"].float()  # [M,3] global
+    anchor_strides = det["anchor_strides"].float()  # [M,3]
+    scores = det["scores"].float()  # [M]
+    classes = det["classes"].long()  # [M]
+    masks_local = det["onehot"][:, 0].bool()  # [M,96,96,48] patch-local
+    offsets = det["offset"].long()  # [M,3] patch origin (global)
 
-    Output (per image):
-      - instance_mask:        [1,H,W,D] int64 (0=bg, 1..G)
-      - onehot: [G,1,H,W,D] bool
-      - bboxes:               [G,6] global boxes
-      - centers:              [G,3] global centers
-      - strides:              [G,3]
-      - scores:               [G] aggregated scores (max over grouped boxes)
-    """
-    # -------------------- basic setup --------------------
-    P = len(x.get("scores", []))
-    device = x["scores"][0].device if P > 0 else torch.device("cpu")
-    H, W, D = output_shape
-
-    # -------------------- flatten all instances across patches --------------------
-    all_boxes: List[Tensor] = []
-    all_scores: List[Tensor] = []
-    all_logits: List[Tensor] = []
-    all_offsets: List[Tensor] = []
-    all_centers: List[Tensor] = []
-    all_strides: List[Tensor] = []
-
-    for p in range(P):
-        scores_p = x["scores"][p]
-        if scores_p.numel() == 0:
-            continue
-
-        bboxes_p  = x["bboxes"][p]                 # [Kp,6] local
-        centers_p = x["anchor_centers"][p]         # [Kp,3] local
-        strides_p = x["anchor_strides"][p]         # [Kp,3]
-        logits_p  = x["onehot_logits"][p]          # [Kp,1,ph,pw,pd]
-        offset_p  = x["offset"][p].view(1, 3)      # [1,3]
-
-        Kp = int(bboxes_p.shape[0])
-        if Kp == 0:
-            continue
-
-        # shift boxes/centers to global
-        bboxes_g = bboxes_p.clone()
-        bboxes_g[:, :3] += offset_p
-        bboxes_g[:, 3:] += offset_p
-
-        centers_g = centers_p + offset_p
-        offsets_g = offset_p.expand(Kp, 3)
-
-        all_boxes.append(bboxes_g)
-        all_scores.append(scores_p)
-        all_logits.append(logits_p)
-        all_offsets.append(offsets_g)
-        all_centers.append(centers_g)
-        all_strides.append(strides_p)
-
-    # empty (no detections at all)
-    if len(all_scores) == 0:
-        instance_mask = torch.zeros((1, H, W, D), dtype=torch.int64, device=device)
-        onehot = torch.zeros((0, 1, H, W, D), dtype=torch.bool, device=device)
+    M = int(anchor_centers.shape[0])
+    if M == 0:
         return {
-            "instance_mask": instance_mask,
-            "onehot": onehot,
-            "bboxes": torch.zeros((0, 6), dtype=torch.float32, device=device),
-            "centers": torch.zeros((0, 3), dtype=torch.float32, device=device),
-            "strides": torch.zeros((0, 3), dtype=torch.float32, device=device),
-            "scores": torch.zeros((0,), dtype=torch.float32, device=device),
+            "anchor_centers": anchor_centers.new_zeros((0, 3)),
+            "anchor_strides": anchor_strides.new_zeros((0, 3)),
+            "classes": classes.new_zeros((0,)),
+            "scores": scores.new_zeros((0,)),
+            "onehot": masks_local.new_zeros((0, 1, X, Y, Z)),
+            "offset": offsets.new_zeros((0, 3)),
         }
 
-    boxes   = torch.cat(all_boxes, dim=0).float()        # [N,6]
-    scores  = torch.cat(all_scores, dim=0).float()       # [N]
-    logits  = torch.cat(all_logits, dim=0)               # [N,1,ph,pw,pd]
-    offsets = torch.cat(all_offsets, dim=0).long()       # [N,3] (global origin of each patch for that instance)
-    centers = torch.cat(all_centers, dim=0).float()      # [N,3]
-    strides = torch.cat(all_strides, dim=0).float()      # [N,3]
-    N = int(scores.numel())
+    # -------- Step A: build sparse global keys for each mask (offset used ONLY here) --------
+    keys: List[Tensor] = [None] * M  # type: ignore[assignment]
+    vols = torch.empty((M,), dtype=torch.int64, device="cpu")  # keep vols on cpu ints
 
-    # -------------------- group instances by IoM/IoU threshold --------------------
-    iom = box_intersection_over_minimum(boxes, boxes)  # [N,N], on device
+    for i in range(M):
+        idx = torch.nonzero(masks_local[i], as_tuple=False)  # [P,3] patch coords
+        if idx.numel() == 0:
+            keys[i] = torch.empty((0,), dtype=torch.int64, device=device)
+            vols[i] = 0
+            continue
+        gxyz = idx + offsets[i].view(1, 3)  # [P,3] global coords
+        k = _encode_xyz_to_key(gxyz, output_shape)  # [P]
+        k = torch.unique(k)
+        k, _ = torch.sort(k)
+        keys[i] = k
+        vols[i] = int(k.numel())
 
-    uf = _UnionFind(N)
+    # -------- Step 1: pairwise proximity gating (your batched_lbe style) --------
+    # axis-wise anchor distance vs half-sum strid
+    # pairwise_anchor_dist: [M,M,3]
+    pairwise_anchor_dist = (anchor_centers[None] - anchor_centers[:, None]).abs()
+    max_anchor_dist = 0.5 * (anchor_strides[None] + anchor_strides[:, None])
+    is_close = torch.all(pairwise_anchor_dist < max_anchor_dist, dim=-1)  # [M,M]
+    # remove self edges
+    is_close.fill_diagonal_(False)
 
-    triu = torch.triu(iom, diagonal=1)
-    edges = (triu >= float(iou_thr)).nonzero(as_tuple=False)  # [E,2] on device
+    # -------- Step 2: IoM mask criterion (sparse, computed only for close pairs) --------
+    # We'll build adjacency as union-find to avoid an MxM boolean build based on expensive IoM.
+    uf = _UnionFind(M)
 
-    # UnionFind is python-side; move edges once
-    for i, j in edges.cpu().tolist():
-        uf.union(int(i), int(j))
+    # grouped = is_close & (IoM > group_thresh)
+    # we compute IoM lazily for (i,j) where is_close is True.
 
-    # Build groups: root -> member indices
+    close_pairs = torch.nonzero(is_close, as_tuple=False)  # [E,2]
+    # To avoid double-checking (i,j) and (j,i), only keep i<j
+    close_pairs = close_pairs[close_pairs[:, 0] < close_pairs[:, 1]]
+
+    for ij in close_pairs:
+        i = int(ij[0].item())
+        j = int(ij[1].item())
+
+        vi = int(vols[i].item())
+        vj = int(vols[j].item())
+        if vi == 0 or vj == 0:
+            continue
+
+        inter = _intersect_count_sorted(keys[i], keys[j])
+        if inter == 0:
+            continue
+
+        iom = inter / max(1, min(vi, vj))
+        if iom > group_thresh:
+            uf.union(i, j)
+
+    # -------- Step 3: connected components (your find_connected_components analogue) --------
     groups: Dict[int, List[int]] = {}
-    for i in range(N):
+    for i in range(M):
         r = uf.find(i)
         groups.setdefault(r, []).append(i)
 
-    # -------------------- aggregate group metadata --------------------
-    # We'll build a "group struct" list so sorting keeps members aligned.
-    group_list = []
-    for members in groups.values():
-        idx = torch.as_tensor(members, device=device, dtype=torch.long)
+    group_list = list(groups.values())
+    # Sort groups by best score (helps if you later resolve overlaps)
+    group_list.sort(key=lambda ids: float(scores[torch.tensor(ids, device=device)].max().item()), reverse=True)
 
-        b = boxes[idx]  # [m,6]
-        merged_box = torch.stack(
-            [b[:, 0].min(), b[:, 1].min(), b[:, 2].min(),
-             b[:, 3].max(), b[:, 4].max(), b[:, 5].max()],
-            dim=0,
-        )  # float [6]
-
-        s = scores[idx]                       # [m]
-        rep = idx[torch.argmax(s)]            # representative (highest score)
-        s_agg = s.max()                       # group score = max
-
-        group_list.append({
-            "members": members,               # list[int] (indices into flattened N)
-            "box": merged_box,                # [6] float
-            "center": centers[rep],           # [3] float
-            "stride": strides[rep],           # [3] float
-            "score": s_agg,                   # scalar float
-        })
-
-    # Sort ascending score so higher scores overwrite later in instance_mask
-    group_list.sort(key=lambda g: float(g["score"]))
-
+    # -------- Step 4: merge each group (union masks) + average center/stride --------
     G = len(group_list)
+    out_centers = torch.empty((G, 3), dtype=torch.float32, device=device)
+    out_strides = torch.empty((G, 3), dtype=torch.float32, device=device)
+    out_scores = torch.empty((G,), dtype=torch.float32, device=device)
+    out_classes = torch.empty((G,), dtype=torch.long, device=device)
 
-    # -------------------- build global instance masks --------------------
-    instance_mask = torch.zeros((1, H, W, D), dtype=torch.int64, device=device)
-    onehot_global = torch.zeros((G, 1, H, W, D), dtype=torch.bool, device=device)
+    out_onehot = torch.zeros((G, 1, X, Y, Z), dtype=torch.bool, device=device)
+    out_offset = torch.zeros((G, 3), dtype=torch.long, device=device)  # global masks => offset=0
 
-    # We'll keep outputs aligned with this sorted order: instance id = k+1
-    out_boxes   = torch.zeros((G, 6), dtype=torch.float32, device=device)
-    out_centers = torch.zeros((G, 3), dtype=torch.float32, device=device)
-    out_strides = torch.zeros((G, 3), dtype=torch.float32, device=device)
-    out_scores  = torch.zeros((G,),   dtype=torch.float32, device=device)
+    for gi, ids in enumerate(group_list):
+        ids_t = torch.tensor(ids, device=device, dtype=torch.long)
 
-    mask_thr = float(mask_thr)  # prob threshold
+        out_centers[gi] = anchor_centers[ids_t].mean(dim=0)
+        out_strides[gi] = anchor_strides[ids_t].mean(dim=0)
+        out_scores[gi] = scores[ids_t].max()
+        out_classes[gi] = classes[ids_t][0]  # single-class
 
-    for k, g in enumerate(group_list):
-        members = g["members"]
+        # union keys -> paint global mask
+        kcat = torch.cat([keys[k] for k in ids], dim=0)
+        kuniq = torch.unique(kcat)
+        xyz = _decode_key_to_xyz(kuniq, output_shape)  # [P,3]
 
-        out_boxes[k] = g["box"].to(out_boxes.dtype)
-        out_centers[k] = g["center"].to(out_centers.dtype)
-        out_strides[k] = g["stride"].to(out_strides.dtype)
-        out_scores[k] = float(g["score"])
-
-        # crop region from merged global box
-        bx = g["box"].to(torch.long)  # [6]
-        x1, y1, z1, x2, y2, z2 = bx.tolist()
-
-        # clamp to canvas bounds
-        gx1, gy1, gz1 = max(0, x1), max(0, y1), max(0, z1)
-        gx2, gy2, gz2 = min(H, x2), min(W, y2), min(D, z2)
-
-        if gx2 <= gx1 or gy2 <= gy1 or gz2 <= gz1:
-            continue
-
-        # accumulate probabilities and counts in the cropped region
-        crop_shape = (gx2 - gx1, gy2 - gy1, gz2 - gz1)
-        acc = torch.zeros(crop_shape, dtype=torch.float32, device=device)
-        cnt = torch.zeros(crop_shape, dtype=torch.float32, device=device)
-
-        for m in members:
-            # local logits -> probs
-            m_prob = torch.sigmoid(logits[m, 0]).to(torch.float32)  # [ph,pw,pd]
-            ox, oy, oz = offsets[m].tolist()
-
-            ph, pw, pd = m_prob.shape
-            px1, py1, pz1 = ox, oy, oz
-            px2, py2, pz2 = ox + ph, oy + pw, oz + pd
-
-            # intersection with group crop
-            ix1, iy1, iz1 = max(gx1, px1), max(gy1, py1), max(gz1, pz1)
-            ix2, iy2, iz2 = min(gx2, px2), min(gy2, py2), min(gz2, pz2)
-
-            if ix2 <= ix1 or iy2 <= iy1 or iz2 <= iz1:
-                continue
-
-            # map to acc indices
-            ax1, ay1, az1 = ix1 - gx1, iy1 - gy1, iz1 - gz1
-            ax2, ay2, az2 = ix2 - gx1, iy2 - gy1, iz2 - gz1
-
-            # map to local indices
-            lx1, ly1, lz1 = ix1 - px1, iy1 - py1, iz1 - pz1
-            lx2, ly2, lz2 = ix2 - px1, iy2 - py1, iz2 - pz1
-
-            patch_crop = m_prob[lx1:lx2, ly1:ly2, lz1:lz2]
-            acc[ax1:ax2, ay1:ay2, az1:az2] += patch_crop
-            cnt[ax1:ax2, ay1:ay2, az1:az2] += 1.0
-
-        # average probs where covered
-        mean_prob = acc / cnt.clamp_min(1.0)
-        tmp = mean_prob >= mask_thr  # boolean mask in crop
-
-        if not torch.any(tmp):
-            continue
-
-        # write onehot + instance id (safe, no chained indexing bug)
-        onehot_global[k, 0, gx1:gx2, gy1:gy2, gz1:gz2] = tmp
-        instance_mask[0, gx1:gx2, gy1:gy2, gz1:gz2].masked_fill_(tmp, k + 1)
-
-    # -------------------- keep only actually-present instances --------------------
-    remained = list(get_unique_labels(instance_mask, is_onehot=False, discard=0))  # labels in {1..G}
-    if len(remained) == 0:
-        # nothing survived thresholding
-        empty_onehot = torch.zeros((0, 1, H, W, D), dtype=torch.bool, device=device)
-        return {
-            "instance_mask": torch.zeros((1, H, W, D), dtype=torch.int64, device=device),
-            "onehot": empty_onehot,
-            "bboxes": torch.zeros((0, 6), dtype=torch.float32, device=device),
-            "centers": torch.zeros((0, 3), dtype=torch.float32, device=device),
-            "strides": torch.zeros((0, 3), dtype=torch.float32, device=device),
-            "scores": torch.zeros((0,), dtype=torch.float32, device=device),
-        }
-
-    remained_idx = torch.as_tensor([int(x) - 1 for x in remained], device=device, dtype=torch.long)
+        x = xyz[:, 0].clamp_(0, X - 1)
+        y = xyz[:, 1].clamp_(0, Y - 1)
+        z = xyz[:, 2].clamp_(0, Z - 1)
+        out_onehot[gi, 0, x, y, z] = True
 
     return {
-        "instance_mask": relabel_sequential(instance_mask, exclude_background=True), # [1,H,W,D]
-        "onehot": onehot_global[remained_idx],  # [G',1,H,W,D]
-        "bboxes": out_boxes[remained_idx],                    # [G',6]
-        "centers": out_centers[remained_idx],                 # [G',3]
-        "strides": out_strides[remained_idx],                 # [G',3]
-        "scores": out_scores[remained_idx],                   # [G']
+        "anchor_centers": out_centers,
+        "anchor_strides": out_strides,
+        "classes": out_classes,
+        "scores": out_scores,
+        "onehot": out_onehot,
+        "offset": out_offset,
     }
