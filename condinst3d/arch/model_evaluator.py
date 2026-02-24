@@ -10,9 +10,29 @@ from condinst3d.evaluator.iou import mask_intersection_over_union, box_intersect
 from condinst3d.utils.detection import onehot_to_instance_mask
 from condinst3d.visualization.utils import get_stats
 from condinst3d.evaluator.metrics.cfm_based import compute_precision, compute_fi, compute_recall
-from condinst3d.evaluator.metrics import AveragePrecision, DetectionConfusionMatrix
+from condinst3d.evaluator.metrics import AveragePrecision, DetectionConfusionMatrix, GlobalConfluentInstanceRecall, DetectionFROC
+from condinst3d.utils.mask import build_gt_cluster_ids
 from condinst3d.visualization.list_instance_boxseg_visualizer import ListInstanceBoxSegSliceVisualizer
 import torchmetrics
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+@torch.no_grad()
+def plot_froc_curve(curve: Dict[str, torch.Tensor], fppi_max: float = 8.0, title: str = "FROC"):
+    x = curve["fppi"].detach().cpu()
+    y = curve["sensitivity"].detach().cpu()
+
+    fig = plt.figure(figsize=(7, 6))
+    plt.plot(x, y, linewidth=2)
+    plt.xlim(0, fppi_max)
+    plt.ylim(0, 1.0)
+    plt.xlabel("False Positives per Image (FPPI)")
+    plt.ylabel("Sensitivity")
+    plt.title(title)
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    return fig
+
 
 def _to_float(x: Tensor | float) -> Tensor | float:
     # keep tensors as tensors (Lightning likes tensors), but avoid accidental MetaTensor issues
@@ -50,15 +70,22 @@ class ModelEvaluator(pl.LightningModule):
         self.pred_key = pred_key
         self.target_key = target_key
 
-        iou_list = [0.01, 0.1, 0.2, 0.3, 0.4, 0.5]
-        ap_n_interp = 11
+        iou_list = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
         # -------------------- metrics --------------------
         self.metrics = nn.ModuleDict({
             "test": torchmetrics.MetricCollection({
                 "mask_cfm": DetectionConfusionMatrix(iou_thresholds=iou_list),
-                "mask_ap": AveragePrecision(iou_thresholds=iou_list, interpolation=ap_n_interp),
+                "mask_ap": AveragePrecision(iou_thresholds=iou_list),
+                "mask_gcir": GlobalConfluentInstanceRecall(iou_thresholds=0.1),
+                "mask_froc": DetectionFROC(
+                    iou_thr=0.10,
+                    n_thresholds=200,
+                    score_min=0.0,
+                    score_max=1.0,
+                ),
+
                 "box_cfm": DetectionConfusionMatrix(iou_thresholds=iou_list),
-                "box_ap": AveragePrecision(iou_thresholds=iou_list, interpolation=ap_n_interp),
+                "box_ap": AveragePrecision(iou_thresholds=iou_list),
             })
         })
 
@@ -135,7 +162,7 @@ class ModelEvaluator(pl.LightningModule):
             gt_boxes = _ensure_boxes_2d(tgt["boxes"], "gt_boxes")
 
             pairwise_box_iou = box_intersection_over_union(pred_boxes, gt_boxes)  # [K,G]
-            metric_dict["box_cfm"].update(pairwise_box_iou)
+            metric_dict["box_cfm"].update(pairwise_box_iou, scores)
             metric_dict["box_ap"].update(pairwise_box_iou, scores)
 
             if has_mask:
@@ -146,8 +173,17 @@ class ModelEvaluator(pl.LightningModule):
                 pairwise_mask_iou = mask_intersection_over_union(
                     pred_onehot, gt_onehot, max_chunk_size=32
                 )
-                metric_dict["mask_cfm"].update(pairwise_mask_iou)
+                metric_dict["mask_cfm"].update(pairwise_mask_iou, scores)
                 metric_dict["mask_ap"].update(pairwise_mask_iou, scores)
+
+                gt_cluster_ids = build_gt_cluster_ids(
+                    semantic_mask=tgt["semantic_mask"][0],
+                    instance_mask=tgt["instance_mask"][0],
+                    connectivity=26,
+                    min_instances_in_cluster=2,
+                )
+                metric_dict["mask_gcir"].update(pairwise_mask_iou, scores, gt_cluster_ids)
+                metric_dict["mask_froc"].update(pairwise_mask_iou, scores)
 
         if has_mask:
             # -------- visualization gate --------
@@ -231,13 +267,16 @@ class ModelEvaluator(pl.LightningModule):
         )
 
         # ---------------- Masks ----------------
-        if len(metric_dict["mask_ap"].scores) > 0:
+        if len(metric_dict["mask_ap"].scores_all) > 0:
             mask_cfm: Tensor = metric_dict["mask_cfm"].compute()  # [T,3]
             mask_ap: Tensor = metric_dict["mask_ap"].compute()  # [T] or [T,...]
+            mask_gcir: Tensor = metric_dict["mask_gcir"].compute()
+
             mask_fig, _ = metric_dict["mask_ap"].plot()
 
             self._log_figure("Masks/PR-curve", mask_fig, close=True)
             self._log_scalar("Masks/mAP", _safe_mean(mask_ap))
+            self._log_scalar("Masks/GCIR @ IoU=0.1", mask_gcir)
 
             mask_thresholds = metric_dict["mask_cfm"].iou_thresholds
             self._log_cfm_series(
@@ -246,6 +285,23 @@ class ModelEvaluator(pl.LightningModule):
                 iou_thresholds=mask_thresholds,
                 ap_per_thr=mask_ap if mask_ap.numel() else None,
             )
+
+            mask_froc = metric_dict["mask_froc"]
+
+            curve = mask_froc.compute()  # {"thresholds","fppi","sensitivity"}
+            auc = mask_froc.auc(fppi_max=8.0)  # scalar tensor
+            ops = mask_froc.sensitivity_at_fppi((0.5, 1, 2, 4, 8))
+
+            # log scalar(s)
+            self._log_scalar("Masks/FROC_AUC@8", auc)
+
+            for fp, sens in ops.items():
+                self._log_scalar(f"Masks/Sens@FPPI{fp:g}", sens)
+
+            # plot + log figure
+            if self.trainer.is_global_zero:
+                fig = plot_froc_curve(curve, fppi_max=8.0, title="Masks FROC @ IoU=0.1")
+                self._log_figure("Masks/FROC", fig, close=True)
 
         # ---------------- reset once ----------------
         metric_dict.reset()
