@@ -221,14 +221,8 @@ def get_onehot_instance_mask_boxes(instance_segmentation: Tensor) -> Tensor:
 
 def priority_based_onehot_to_instance_mask(onehot_mask: Tensor, scores: Tensor) -> Tensor:
     """
-    onehot_mask:
-      - [N, 1, H, W, D] or [N, H, W, D]   (typical)
-      - or [N, C, H, W, D]               (multi-class)
-    scores: [N]
-
-    Returns:
-      instance_mask: [C, H, W, D] where labels are 1..N (global instance ids by score rank),
-      or [1, H, W, D] if C=1. Background = 0.
+    Paint instances in descending score order, only into currently-empty voxels.
+    This avoids voxelwise argmax speckle in overlap regions.
     """
     if onehot_mask.ndim == 4:
         onehot_mask = onehot_mask.unsqueeze(1)  # [N,1,H,W,D]
@@ -241,23 +235,19 @@ def priority_based_onehot_to_instance_mask(onehot_mask: Tensor, scores: Tensor) 
     if scores.numel() != N:
         raise ValueError(f"N(onehot) != len(scores): {N} != {scores.numel()}")
 
+    inst = onehot_mask.new_zeros((C, H, W, D), dtype=torch.int16)
     if N == 0:
-        return onehot_mask.new_zeros((C, H, W, D), dtype=torch.int16)
+        return inst
 
-    # Ensure boolean for correct masking; allow float/bool inputs
-    m = onehot_mask > 0  # [N,C,H,W,D] bool
+    m = onehot_mask > 0  # bool
+    order = torch.argsort(scores.to(device=m.device, dtype=torch.float32), descending=True)
 
-    # Put scores on same device/dtype as we need for broadcast
-    s = scores.to(device=m.device, dtype=torch.float32).view(N, 1, 1, 1, 1)
-
-    # Score-weighted masks; background is 0 score
-    weighted = m.to(torch.float32) * s  # [N,C,H,W,D]
-
-    # Best instance per voxel
-    best_score, best_idx = weighted.max(dim=0)  # each: [C,H,W,D], idx in [0..N-1]
-    # Convert to instance labels (idx+1) only where any instance present
-    inst = (best_idx + 1).to(torch.int16)
-    inst = torch.where(best_score > 0, inst, inst.new_zeros(()).expand_as(inst))
+    for rank, idx in enumerate(order.tolist()):
+        label_id = rank + 1
+        empty = inst == 0
+        write = m[idx] & empty
+        if write.any():
+            inst = torch.where(write, inst.new_full((), label_id), inst)
 
     return inst
 
