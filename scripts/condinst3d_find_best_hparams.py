@@ -79,6 +79,7 @@ class HyperParamOptimizer:
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         model = CondInst3dPRL(cfg=cfg.model)
         model.load_state_dict(ckpt["state_dict"], strict=True)
+        model.num_images_to_show = 0
         self.model = model
 
         # Make validate fast + deterministic-ish
@@ -91,7 +92,8 @@ class HyperParamOptimizer:
             callbacks=[TQDMProgressBar(refresh_rate=20)],
         )
 
-        self.metric_key = "Validation/Masks/mAP"  # change if needed
+        # self.metric_key = "Validation/Masks/mAP"  # change if needed
+        self.metric_key = "Validation/Masks-IoU/AP@0.10"
 
     def objective_function(self, trial: optuna.Trial):
         # IMPORTANT: reseed so every trial sees the same validation randomness/order
@@ -101,16 +103,12 @@ class HyperParamOptimizer:
 
         params = {
             "mask_thresh": trial.suggest_float("mask_thresh", 0.4, 0.6),
-            "score_thresh": trial.suggest_float("score_thresh", 0.4, 0.7),
-            "nms_thresh": trial.suggest_float("nms_thresh", 0.1, 0.9),
-            "group_thresh": trial.suggest_float("group_thresh", 0.1, 0.9),
-            "topk_candidates": trial.suggest_int("topk_candidates", 5, 25),
+            "score_thresh": trial.suggest_float("score_thresh", 0.05, 0.4, step=0.05),
+            "nms_thresh": trial.suggest_float("nms_thresh", 0.1, 0.6, step=0.05),
+            "group_thresh": trial.suggest_float("group_thresh", 0.05, 0.35, step=0.05),
+            "topk_candidates": trial.suggest_int("topk_candidates", 5, 30, step=5),
         }
         self.model.inference_hyperparams = params
-
-        patch_overlap = trial.suggest_float("patch_overlap", 0.2, 0.6)
-        self.dm.patch_overlap = patch_overlap
-        self.dm.setup("validate")
 
         with torch.inference_mode():
             val_metrics = self.trainer.validate(self.model, datamodule=self.dm, verbose=False)
@@ -151,7 +149,7 @@ def main(cfg: DictConfig) -> None:
     ckpt_path = "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/condinst3d-prl-final/2026-02-21_00-58-25/tb/version_0/checkpoints/best_epoch=309-step=29450.ckpt"
     optimum_finder = HyperParamOptimizer(cfg=cfg, ckpt_path=ckpt_path)
 
-    best_params = optimum_finder.find_optimum(100)
+    best_params = optimum_finder.find_optimum(20)
     print(f"Best val inference result:")
     print(best_params)
 
