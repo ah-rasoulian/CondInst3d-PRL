@@ -1,100 +1,94 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Dict, Sequence, Tuple
 
 import torch
+import torchmetrics
 
 
-def _greedy_match_tp_fp(
-    iou: torch.Tensor,          # [K, G]
-    scores: torch.Tensor,       # [K]
+@torch.no_grad()
+def _greedy_match_sorted(
+    iou_sorted: torch.Tensor,  # [K, G], predictions already sorted by score desc
     iou_thr: float,
-    score_thr: float,
-) -> Tuple[int, int, int]:
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """
-    Greedy one-to-one matching:
-      - sort predictions by descending score
-      - each prediction matches best currently-unmatched GT
-      - TP if best IoU >= iou_thr else FP
-    Returns: (tp, fp, fn) for this image at this score_thr
+    Greedy 1-1 matching along the sorted predictions.
+    Returns:
+      tp_inc: [K] {0,1} per prediction rank
+      fp_inc: [K] {0,1} per prediction rank
+      G: number of GT
     """
-    device = iou.device
-    K = int(iou.shape[0])
-    G = int(iou.shape[1])
+    device = iou_sorted.device
+    K, G = int(iou_sorted.shape[0]), int(iou_sorted.shape[1])
 
-    # filter by score threshold
-    keep = scores >= score_thr
-    if keep.any():
-        sel_scores = scores[keep]
-        sel_iou = iou[keep]
-    else:
-        sel_scores = scores.new_zeros((0,))
-        sel_iou = iou.new_zeros((0, G))
+    if K == 0:
+        return torch.zeros((0,), device=device), torch.zeros((0,), device=device), G
 
-    # no GT edge case
     if G == 0:
-        tp = 0
-        fp = int(sel_scores.numel())
-        fn = 0
-        return tp, fp, fn
+        # everything is FP
+        tp_inc = torch.zeros((K,), device=device, dtype=torch.float32)
+        fp_inc = torch.ones((K,), device=device, dtype=torch.float32)
+        return tp_inc, fp_inc, 0
 
-    # no predictions edge case
-    if sel_scores.numel() == 0:
-        tp = 0
-        fp = 0
-        fn = G
-        return tp, fp, fn
+    matched_gt = torch.zeros((G,), device=device, dtype=torch.bool)
+    tp_inc = torch.zeros((K,), device=device, dtype=torch.float32)
+    fp_inc = torch.zeros((K,), device=device, dtype=torch.float32)
 
-    order = torch.argsort(sel_scores, descending=True)
-    sel_iou = sel_iou[order]
-
-    matched_gt = torch.zeros((G,), dtype=torch.bool, device=device)
-
-    tp = 0
-    fp = 0
-    for p in range(sel_iou.shape[0]):
-        # best GT for this prediction
-        best_iou, best_g = torch.max(sel_iou[p], dim=0)
-        if best_iou >= iou_thr and (not matched_gt[best_g]):
+    for k in range(K):
+        best_iou, best_g = torch.max(iou_sorted[k], dim=0)
+        if (best_iou >= iou_thr) and (not matched_gt[best_g]):
             matched_gt[best_g] = True
-            tp += 1
+            tp_inc[k] = 1.0
         else:
-            fp += 1
+            fp_inc[k] = 1.0
 
-    fn = int((~matched_gt).sum().item())
-    return tp, fp, fn
+    return tp_inc, fp_inc, G
 
 
-@dataclass
-class DetectionFROC:
+class DetectionFROC(torchmetrics.Metric):
     """
-    FROC metric for detection/instance segmentation.
-    Stores per-image pairwise IoU and scores, then computes:
-      - FPPI (false positives per image) vs Sensitivity (TPR) curve
-      - Optional AUC over FPPI range
+    FROC: Sensitivity vs FPPI (false positives per image)
+
+    DDP-safe: accumulates fixed-size TP/FP/FN arrays over score thresholds.
     """
-    iou_thr: float = 0.1
-    n_thresholds: int = 200
-    score_min: float = 0.0
-    score_max: float = 1.0
-    device: str = "cpu"
+    is_differentiable = False
+    higher_is_better = True
+    full_state_update = False
 
-    # internal buffers (kept on CPU by default)
-    _ious: List[torch.Tensor] = field(default_factory=list)
-    _scores: List[torch.Tensor] = field(default_factory=list)
-    _num_gt: List[int] = field(default_factory=list)
+    def __init__(
+        self,
+        iou_thr: float = 0.1,
+        n_thresholds: int = 200,
+        score_min: float = 0.0,
+        score_max: float = 1.0,
+        dist_sync_on_step: bool = False,
+    ):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
 
-    def reset(self) -> None:
-        self._ious.clear()
-        self._scores.clear()
-        self._num_gt.clear()
+        if n_thresholds < 2:
+            raise ValueError("n_thresholds must be >= 2")
+
+        self.iou_thr = float(iou_thr)
+        self.n_thresholds = int(n_thresholds)
+        self.score_min = float(score_min)
+        self.score_max = float(score_max)
+
+        # fixed threshold grid
+        thresholds = torch.linspace(self.score_min, self.score_max, self.n_thresholds)
+        self.register_buffer("thresholds", thresholds)
+
+        # states reduced across ranks by sum
+        self.add_state("tp", default=torch.zeros(self.n_thresholds), dist_reduce_fx="sum")
+        self.add_state("fp", default=torch.zeros(self.n_thresholds), dist_reduce_fx="sum")
+        self.add_state("fn", default=torch.zeros(self.n_thresholds), dist_reduce_fx="sum")
+        self.add_state("num_images", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
     @torch.no_grad()
     def update(self, pairwise_iou: torch.Tensor, scores: torch.Tensor) -> None:
         """
-        pairwise_iou: [K, G] IoU between predicted instances and GT instances for ONE image
-        scores:       [K]    confidence scores for predicted instances for ONE image
+        pairwise_iou: [K, G]
+        scores:       [K]
         """
         if pairwise_iou.ndim != 2:
             raise ValueError(f"pairwise_iou must be [K,G], got {tuple(pairwise_iou.shape)}")
@@ -103,137 +97,122 @@ class DetectionFROC:
         if pairwise_iou.shape[0] != scores.shape[0]:
             raise ValueError("K mismatch: pairwise_iou.shape[0] must equal scores.shape[0]")
 
-        # move to metric device (CPU recommended)
-        self._ious.append(pairwise_iou.detach().to(self.device))
-        self._scores.append(scores.detach().to(self.device))
-        self._num_gt.append(int(pairwise_iou.shape[1]))
+        device = self.tp.device
+        pairwise_iou = pairwise_iou.to(device)
+        scores = scores.to(device)
+
+        # Sort by score desc once
+        if scores.numel() > 0:
+            order = torch.argsort(scores, descending=True)
+            scores_sorted = scores[order]
+            iou_sorted = pairwise_iou[order]
+        else:
+            scores_sorted = scores
+            iou_sorted = pairwise_iou
+
+        tp_inc, fp_inc, G = _greedy_match_sorted(iou_sorted, self.iou_thr)
+
+        # cumulative counts for top-k predictions
+        tp_cum = torch.cumsum(tp_inc, dim=0)  # [K]
+        fp_cum = torch.cumsum(fp_inc, dim=0)  # [K]
+
+        # For each threshold t, let k(t) = #preds with score >= t.
+        # scores_sorted is descending. Create ascending version for searchsorted.
+        if scores_sorted.numel() == 0:
+            k_per_t = torch.zeros_like(self.thresholds, dtype=torch.long)
+        else:
+            scores_asc = torch.flip(scores_sorted, dims=(0,))  # ascending
+            # # of scores < t in ascending order
+            num_lt = torch.searchsorted(scores_asc, self.thresholds, right=False)
+            k_per_t = scores_sorted.numel() - num_lt  # # >= t
+
+        # map k -> tp/fp using cumulative arrays (tp_cum[k-1])
+        # if k==0 -> 0
+        tp_t = torch.zeros((self.n_thresholds,), device=device, dtype=torch.float32)
+        fp_t = torch.zeros((self.n_thresholds,), device=device, dtype=torch.float32)
+
+        nonzero = k_per_t > 0
+        if nonzero.any():
+            k_nz = k_per_t[nonzero] - 1
+            tp_t[nonzero] = tp_cum[k_nz]
+            fp_t[nonzero] = fp_cum[k_nz]
+
+        fn_t = float(G) - tp_t  # [T]
+
+        self.tp += tp_t
+        self.fp += fp_t
+        self.fn += fn_t
+        self.num_images += 1.0
 
     @torch.no_grad()
-    def compute_curve(self) -> Dict[str, torch.Tensor]:
+    def compute(self) -> Dict[str, torch.Tensor]:
         """
-        Returns:
+        Returns dict with:
           thresholds: [T]
-          fppi:       [T]
-          sensitivity:[T]
+          fppi: [T]
+          sensitivity: [T]
         """
-        if len(self._ious) == 0:
-            return {
-                "thresholds": torch.empty((0,)),
-                "fppi": torch.empty((0,)),
-                "sensitivity": torch.empty((0,)),
-            }
+        thresholds = self.thresholds
 
-        thresholds = torch.linspace(self.score_min, self.score_max, self.n_thresholds, device=self.device)
+        # avoid div by 0
+        num_images = torch.clamp(self.num_images, min=1.0)
+        denom = torch.clamp(self.tp + self.fn, min=1e-12)
 
-        total_images = len(self._ious)
-        total_gt = sum(self._num_gt)
+        sensitivity = self.tp / denom
+        fppi = self.fp / num_images
 
-        # Handle case with no GT at all: sensitivity undefined; return zeros
-        if total_gt == 0:
-            fppi = torch.zeros_like(thresholds)
-            sens = torch.zeros_like(thresholds)
-            return {"thresholds": thresholds, "fppi": fppi, "sensitivity": sens}
-
-        fppi_list = []
-        sens_list = []
-
-        for thr in thresholds:
-            tp = 0
-            fp = 0
-            fn = 0
-            for iou, sc in zip(self._ious, self._scores):
-                tpi, fpi, fni = _greedy_match_tp_fp(iou, sc, self.iou_thr, float(thr.item()))
-                tp += tpi
-                fp += fpi
-                fn += fni
-
-            # Sensitivity = TP / (TP + FN) = TP / total_gt
-            sensitivity = tp / (tp + fn + 1e-12)
-            fppi = fp / float(total_images)
-
-            fppi_list.append(fppi)
-            sens_list.append(sensitivity)
-
-        fppi_t = torch.tensor(fppi_list, device=self.device, dtype=torch.float32)
-        sens_t = torch.tensor(sens_list, device=self.device, dtype=torch.float32)
-
-        # Sort by FPPI increasing (nice for plotting/AUC)
-        order = torch.argsort(fppi_t)
+        # Sort by FPPI increasing for nicer plotting/integration
+        order = torch.argsort(fppi)
         return {
             "thresholds": thresholds[order],
-            "fppi": fppi_t[order],
-            "sensitivity": sens_t[order],
+            "fppi": fppi[order],
+            "sensitivity": sensitivity[order],
         }
 
     @torch.no_grad()
-    def compute_auc(self, fppi_max: float = 8.0) -> float:
-        """
-        Area under FROC curve from FPPI=0 to FPPI=fppi_max using trapezoidal rule.
-        """
-        curve = self.compute_curve()
-        x = curve["fppi"]
+    def auc(self, fppi_max: float = 8.0) -> torch.Tensor:
+        curve = self.compute()
+        x = torch.clamp(curve["fppi"], 0.0, float(fppi_max))
         y = curve["sensitivity"]
+
+        # ensure endpoints for stable trapz
         if x.numel() == 0:
-            return 0.0
+            return torch.tensor(0.0, device=self.tp.device)
 
-        # clamp to [0, fppi_max]
-        x_clamped = torch.clamp(x, 0.0, float(fppi_max))
-        # ensure monotonic increasing x (already sorted)
-        # remove duplicates in x for stable integration
-        # (optional) small epsilon jitter:
-        # but simplest: unique via grouping
-        xu, idx = torch.unique_consecutive(x_clamped, return_inverse=False, return_counts=False, dim=0)
-        if xu.numel() != x_clamped.numel():
-            # recompute y by taking max sensitivity for same FPPI (conservative)
-            # group consecutive identical x
-            new_x = []
-            new_y = []
-            start = 0
-            while start < x_clamped.numel():
-                end = start + 1
-                while end < x_clamped.numel() and x_clamped[end] == x_clamped[start]:
-                    end += 1
-                new_x.append(x_clamped[start])
-                new_y.append(torch.max(y[start:end]))
-                start = end
-            x_clamped = torch.stack(new_x)
-            y = torch.stack(new_y)
-
-        # append (0, y_at_0) and (fppi_max, y_at_max) if needed
-        if x_clamped[0] > 0:
-            x_clamped = torch.cat([torch.tensor([0.0], device=self.device), x_clamped])
+        if x[0] > 0:
+            x = torch.cat([x.new_tensor([0.0]), x])
             y = torch.cat([y[:1], y])
-        if x_clamped[-1] < fppi_max:
-            x_clamped = torch.cat([x_clamped, torch.tensor([fppi_max], device=self.device)])
+        if x[-1] < fppi_max:
+            x = torch.cat([x, x.new_tensor([float(fppi_max)])])
             y = torch.cat([y, y[-1:]])
 
-        auc = torch.trapz(y, x_clamped).item() / float(fppi_max)
-        return float(auc)
+        area = torch.trapz(y, x) / float(fppi_max)
+        return area
 
     @torch.no_grad()
-    def sensitivity_at_fppi(self, targets: Sequence[float] = (0.5, 1.0, 2.0, 4.0, 8.0)) -> Dict[float, float]:
-        """
-        Interpolate sensitivity at given FPPI points.
-        """
-        curve = self.compute_curve()
+    def sensitivity_at_fppi(self, targets: Sequence[float] = (0.5, 1, 2, 4, 8)) -> Dict[float, torch.Tensor]:
+        curve = self.compute()
         x = curve["fppi"]
         y = curve["sensitivity"]
-        if x.numel() == 0:
-            return {float(t): 0.0 for t in targets}
+        out: Dict[float, torch.Tensor] = {}
 
-        out: Dict[float, float] = {}
+        if x.numel() == 0:
+            for t in targets:
+                out[float(t)] = torch.tensor(0.0, device=self.tp.device)
+            return out
+
         for t in targets:
             t = float(t)
+            tt = x.new_tensor([t])
             if t <= x[0].item():
-                out[t] = float(y[0].item())
+                out[t] = y[0]
             elif t >= x[-1].item():
-                out[t] = float(y[-1].item())
+                out[t] = y[-1]
             else:
-                # find rightmost x <= t
-                idx = torch.searchsorted(x, torch.tensor([t], device=self.device), right=True).item() - 1
-                x0, x1 = x[idx].item(), x[idx + 1].item()
-                y0, y1 = y[idx].item(), y[idx + 1].item()
-                # linear interp
-                w = 0.0 if x1 == x0 else (t - x0) / (x1 - x0)
-                out[t] = float(y0 + w * (y1 - y0))
+                idx = torch.searchsorted(x, tt, right=True).item() - 1
+                x0, x1 = x[idx], x[idx + 1]
+                y0, y1 = y[idx], y[idx + 1]
+                w = torch.where(x1 == x0, x0.new_tensor(0.0), (tt[0] - x0) / (x1 - x0))
+                out[t] = y0 + w * (y1 - y0)
+
         return out
