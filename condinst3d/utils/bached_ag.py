@@ -132,52 +132,73 @@ def batched_nms(
     return torch.stack(keep).to(dtype=torch.long)
 
 def merge_prediction(
-        det: Dict[str, Tensor],
-        output_shape: Tuple[int, int, int],
-        group_thresh: float,
-    ) -> Dict[str, Tensor]:
+    det: Dict[str, Tensor],
+    output_shape: Tuple[int, int, int],
+    group_thresh: float,
+    mask_thresh: float,
+    *,
+    postproc_transform: Optional[Callable[[Tensor], Tensor]] = None,
+) -> Dict[str, Tensor]:
     """
-            Per-image merge logic:
-              - Group detections if:
-                  (1) ||c_i - c_j|| < 0.5 * (||s_i|| + ||s_j||)
-                  (2) IoM(mask_i, mask_j) > group_thresh, IoM = inter / min(|A|,|B|)
-              - Merge each group by union of masks in original image space
-              - Set center/stride to group average
-            Returns a per-image dict with:
-              onehot: [G,1,X,Y,Z] bool  (global/original image space)
-              offset: [G,3] zeros
-            """
+    Per-image merge logic (updated):
+      - Group detections if:
+          (1) axis-wise proximity gate:
+              |c_i - c_j| < 0.5 * (s_i + s_j)  (per-axis)
+          (2) IoU(prebin_i, prebin_j) > group_thresh
+              where prebin = (onehot_prob > mask_thresh)
+      - Merge each group by max(onehot_prob) in global space, then threshold at mask_thresh
+      - Apply postproc_transform (KeepLargestCC + RemoveSmallObjects + RemoveSmallBBox) to merged mask (optional)
+      - Set center/stride to group average; score to max
+    Returns:
+      onehot: [G,1,X,Y,Z] bool (global space)
+      offset: [G,3] zeros
+    """
     X, Y, Z = output_shape
     device = det["onehot"].device
 
-    anchor_centers = det["anchor_centers"].float()  # [M,3] global
-    anchor_strides = det["anchor_strides"].float()  # [M,3]
-    scores = det["scores"].float()  # [M]
-    classes = det["classes"].long()  # [M]
-    masks_local = det["onehot"][:, 0].bool()  # [M,96,96,48] patch-local
-    offsets = det["offset"].long()  # [M,3] patch origin (global)
+    anchor_centers = det["anchor_centers"].float()   # [M,3] global
+    anchor_strides = det["anchor_strides"].float()   # [M,3]
+    scores = det["scores"].float()                   # [M]
+    classes = det["classes"].long()                  # [M]
+
+    # postprocessed binary (patch-local)
+    masks_post_local = det["onehot"][:, 0].bool()    # [M,ph,pw,pd]
+    offsets = det["offset"].long()                   # [M,3] patch origin (global)
+
+    # pre-postprocess probabilities
+    prob_local = det["onehot_prob"]
+    prob_local = prob_local[:, 0].float() if prob_local.ndim == 5 else prob_local.float()  # [M,ph,pw,pd]
+    prebin_local = prob_local > mask_thresh
 
     M = int(anchor_centers.shape[0])
     if M == 0:
         return {
             "anchor_centers": anchor_centers.new_zeros((0, 3)),
             "anchor_strides": anchor_strides.new_zeros((0, 3)),
-            "classes": classes.new_zeros((0,)),
+            "classes": classes.new_zeros((0,), dtype=torch.long),
             "scores": scores.new_zeros((0,)),
-            "onehot": masks_local.new_zeros((0, 1, X, Y, Z)),
+            "onehot": masks_post_local.new_zeros((0, 1, X, Y, Z)),
+            "onehot_prob": prob_local.new_zeros((0, 1, X, Y, Z)),
             "offset": offsets.new_zeros((0, 3)),
         }
 
-    # -------- Step A: build sparse global keys for each mask (offset used ONLY here) --------
+    # -------- Step A: build sparse global keys for pre-binary (offset used ONLY here) --------
     keys: List[Tensor] = [None] * M  # type: ignore[assignment]
     vols = torch.empty((M,), dtype=torch.int64, device="cpu")  # keep vols on cpu ints
 
     for i in range(M):
-        idx = torch.nonzero(masks_local[i], as_tuple=False)  # [P,3] patch coords
+        # if postprocessed mask is empty, treat as empty detection (safety)
+        if not bool(masks_post_local[i].any()):
+            keys[i] = torch.empty((0,), dtype=torch.int64, device=device)
+            vols[i] = 0
+            continue
+
+        idx = torch.nonzero(prebin_local[i], as_tuple=False)  # [P,3] patch coords
         if idx.numel() == 0:
             keys[i] = torch.empty((0,), dtype=torch.int64, device=device)
             vols[i] = 0
             continue
+
         gxyz = idx + offsets[i].view(1, 3)  # [P,3] global coords
         k = _encode_xyz_to_key(gxyz, output_shape)  # [P]
         k = torch.unique(k)
@@ -185,24 +206,16 @@ def merge_prediction(
         keys[i] = k
         vols[i] = int(k.numel())
 
-    # -------- Step 1: pairwise proximity gating (your batched_lbe style) --------
-    # axis-wise anchor distance vs half-sum strid
-    # pairwise_anchor_dist: [M,M,3]
-    pairwise_anchor_dist = (anchor_centers[None] - anchor_centers[:, None]).abs()
-    max_anchor_dist = 0.5 * (anchor_strides[None] + anchor_strides[:, None])
-    is_close = torch.all(pairwise_anchor_dist < max_anchor_dist, dim=-1)  # [M,M]
-    # remove self edges
+    # -------- Step 1: proximity gating --------
+    pairwise_anchor_dist = (anchor_centers[None] - anchor_centers[:, None]).abs()  # [M,M,3]
+    max_anchor_dist = 0.5 * (anchor_strides[None] + anchor_strides[:, None])       # [M,M,3]
+    is_close = torch.all(pairwise_anchor_dist < max_anchor_dist, dim=-1)           # [M,M]
     is_close.fill_diagonal_(False)
 
-    # -------- Step 2: IoM mask criterion (sparse, computed only for close pairs) --------
-    # We'll build adjacency as union-find to avoid an MxM boolean build based on expensive IoM.
+    # -------- Step 2: IoU criterion on pre-binary keys (computed only for close pairs) --------
     uf = _UnionFind(M)
 
-    # grouped = is_close & (IoM > group_thresh)
-    # we compute IoM lazily for (i,j) where is_close is True.
-
     close_pairs = torch.nonzero(is_close, as_tuple=False)  # [E,2]
-    # To avoid double-checking (i,j) and (j,i), only keep i<j
     close_pairs = close_pairs[close_pairs[:, 0] < close_pairs[:, 1]]
 
     for ij in close_pairs:
@@ -218,21 +231,33 @@ def merge_prediction(
         if inter == 0:
             continue
 
-        iom = inter / max(1, min(vi, vj))
-        if iom > group_thresh:
+        # IoU = inter / (|A| + |B| - inter)
+        denom = max(1, (vi + vj - inter))
+        iou = inter / denom
+        if iou > group_thresh:
             uf.union(i, j)
 
-    # -------- Step 3: connected components (your find_connected_components analogue) --------
+    # -------- Step 3: connected components --------
     groups: Dict[int, List[int]] = {}
     for i in range(M):
         r = uf.find(i)
         groups.setdefault(r, []).append(i)
 
     group_list = list(groups.values())
-    # Sort groups by best score (helps if you later resolve overlaps)
-    group_list.sort(key=lambda ids: float(scores[torch.tensor(ids, device=device)].max().item()), reverse=True)
+    group_list.sort(
+        key=lambda ids: float(scores[torch.tensor(ids, device=device)].max().item()),
+        reverse=True,
+    )
 
-    # -------- Step 4: merge each group (union masks) + average center/stride --------
+    # helper: apply your MONAI Compose on a single (X,Y,Z) bool mask
+    def _postproc(mask_xyz: Tensor) -> Tensor:
+        if postproc_transform is None:
+            return mask_xyz
+        x = mask_xyz.to(torch.uint8)
+        y = postproc_transform(x)
+        return y.bool()
+
+    # -------- Step 4: merge each group using max prob in global space --------
     G = len(group_list)
     out_centers = torch.empty((G, 3), dtype=torch.float32, device=device)
     out_strides = torch.empty((G, 3), dtype=torch.float32, device=device)
@@ -240,6 +265,7 @@ def merge_prediction(
     out_classes = torch.empty((G,), dtype=torch.long, device=device)
 
     out_onehot = torch.zeros((G, 1, X, Y, Z), dtype=torch.bool, device=device)
+    out_prob = torch.zeros((G, 1, X, Y, Z), dtype=torch.float32, device=device)
     out_offset = torch.zeros((G, 3), dtype=torch.long, device=device)  # global masks => offset=0
 
     for gi, ids in enumerate(group_list):
@@ -250,15 +276,32 @@ def merge_prediction(
         out_scores[gi] = scores[ids_t].max()
         out_classes[gi] = classes[ids_t][0]  # single-class
 
-        # union keys -> paint global mask
-        kcat = torch.cat([keys[k] for k in ids], dim=0)
-        kuniq = torch.unique(kcat)
-        xyz = _decode_key_to_xyz(kuniq, output_shape)  # [P,3]
+        # Build merged prob sparsely, only on voxels where prebin is True
+        merged_prob = torch.full((X, Y, Z), -torch.inf, dtype=torch.float32, device=device)
 
-        x = xyz[:, 0].clamp_(0, X - 1)
-        y = xyz[:, 1].clamp_(0, Y - 1)
-        z = xyz[:, 2].clamp_(0, Z - 1)
-        out_onehot[gi, 0, x, y, z] = True
+        for k in ids:
+            idx = torch.nonzero(prebin_local[k], as_tuple=False)  # [P,3]
+            if idx.numel() == 0:
+                continue
+
+            gxyz = idx + offsets[k].view(1, 3)
+            x = gxyz[:, 0].clamp_(0, X - 1)
+            y = gxyz[:, 1].clamp_(0, Y - 1)
+            z = gxyz[:, 2].clamp_(0, Z - 1)
+
+            vals = prob_local[k][idx[:, 0], idx[:, 1], idx[:, 2]]
+            merged_prob[x, y, z] = torch.maximum(merged_prob[x, y, z], vals)
+
+        merged_bin = merged_prob > mask_thresh
+        merged_bin = _postproc(merged_bin)
+
+        # store
+        out_onehot[gi, 0] = merged_bin
+
+        # (optional) also return merged probability for downstream use/visualization
+        # set prob=0 outside merged_bin to keep it compact/meaningful
+        merged_prob = torch.where(merged_bin, merged_prob, torch.zeros_like(merged_prob))
+        out_prob[gi, 0] = merged_prob
 
     return {
         "anchor_centers": out_centers,
@@ -266,5 +309,6 @@ def merge_prediction(
         "classes": out_classes,
         "scores": out_scores,
         "onehot": out_onehot,
+        "onehot_prob": out_prob,
         "offset": out_offset,
     }
