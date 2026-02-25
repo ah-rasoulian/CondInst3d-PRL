@@ -63,7 +63,7 @@ def _squeeze_onehot(onehot: torch.Tensor) -> torch.Tensor:
         return onehot.squeeze(1)
     return onehot
 
-class CondInst3dPRL(pl.LightningModule):
+class AdvancedCondInst3dPRL(pl.LightningModule):
     """
     A 3D Instance Segmentation Network based on CondInst framework.
     """
@@ -76,7 +76,7 @@ class CondInst3dPRL(pl.LightningModule):
         self.forward_chunk_size: int = cfg.forward_chunk_size
         self.max_mask_to_train: int = cfg.max_mask_to_train
         self.backbone: AbstractBackbone = instantiate(cfg.backbone)
-        self.head_level_strides = self.get_head_level_strides(cfg.backbone.strides, cfg.backbone.head_start_index)
+        self.head_level_strides = self.get_head_level_strides(cfg.backbone.strides, cfg.backbone.head_start_index, cfg.backbone.head_end_index)
 
         # --------------- anchor matching ----------------
         self.matcher = AnisotropicATSSMatcher(
@@ -103,11 +103,18 @@ class CondInst3dPRL(pl.LightningModule):
             in_channels=self.backbone.heads_dim,
             num_params=self.instance_segmentation_head.num_params
         )
-        self.semantic_head = nn.Sequential(
+        semantic_heads = [nn.Sequential(
             nn.ReLU(),
-            nn.Conv3d(self.backbone.out_channels, cfg.heads.classification.num_classes + 1, kernel_size=1, padding='same')
+            nn.Conv3d(self.backbone.heads_dim, cfg.heads.classification.num_classes + 1, kernel_size=3, padding='same')
+        ) for h in self.backbone.head_mappings if h is not None]
+        semantic_heads.append(
+            nn.Sequential(
+                nn.ReLU(),
+                nn.Conv3d(self.backbone.out_channels, cfg.heads.classification.num_classes + 1, kernel_size=3,
+                          padding='same')
+            )
         )
-
+        self.semantic_heads = nn.ModuleList(semantic_heads)
         # -------------------- loss functions ---------------------
         self.losses = {
             "classification": instantiate(cfg.losses.classification),
@@ -145,10 +152,12 @@ class CondInst3dPRL(pl.LightningModule):
         self.images_to_visualize: Dict[int, List[int]] = {}
         self.num_images_to_show = int(cfg.visualization.num_images_to_show)
 
-    def get_head_level_strides(self, backbone_strides: Sequence[Sequence[int]], head_start_index: int) -> torch.Tensor:
+    def get_head_level_strides(self, backbone_strides: Sequence[Sequence[int]], head_start_index: int, head_end_index: int) -> torch.Tensor:
         stage = torch.tensor(backbone_strides, dtype=torch.float32)
         cum = torch.cumprod(stage, dim=0)  # [S,3]
-        return cum[head_start_index:]
+        if head_end_index == -1:
+            head_end_index = len(backbone_strides) - 1
+        return cum[head_start_index:head_end_index + 1]
 
     def expand_level_strides_to_anchors(self, anchors_per_level: List[torch.Tensor]) -> torch.Tensor:
         assert len(anchors_per_level) == self.head_level_strides.shape[0]
@@ -350,18 +359,15 @@ class CondInst3dPRL(pl.LightningModule):
           instance_list.get_gt_mask(targets, dtype) -> Tensor aligned with instance_logits
         """
 
+        # instance segmentation loss
         instance_logits = outputs["instance_logits"]
-        semantic_logits = outputs["semantic_logits"]
-        semantic_gt_mask = torch.stack([t["semantic_mask"] for t in targets], dim=0)
-        stride = getattr(self.instance_segmentation_head, "stride", 1)
+        inst_stride = getattr(self.instance_segmentation_head, "stride", 1)
 
         # upsample if needed (supports int or tuple stride)
-        needs_upsample = (stride > 1) if isinstance(stride, int) else any(s > 1 for s in stride)
+        needs_upsample = (inst_stride > 1) if isinstance(inst_stride, int) else any(s > 1 for s in inst_stride)
         if needs_upsample:
-            instance_logits = aligned_trilinear(instance_logits, stride)
-            semantic_logits = aligned_trilinear(semantic_logits, stride)
+            instance_logits = aligned_trilinear(instance_logits, inst_stride)
 
-        semantic_loss = self.losses["semantic_segmentation"](semantic_logits, semantic_gt_mask)
         n_insts = len(instance_list)
         if n_insts == 0:
             instance_loss = instance_logits.sum() * 0.0 + outputs["controller_logits"].sum() * 0.0
@@ -369,9 +375,24 @@ class CondInst3dPRL(pl.LightningModule):
             gt_masks = instance_list.get_gt_mask(targets, dtype=instance_logits.dtype)
             instance_loss = self.losses["instance_segmentation"](instance_logits, gt_masks)
 
+        # semantic segmentation loss
+        semantic_logits = outputs["semantic_logits"]
+        semantic_gt_mask = torch.stack([t["semantic_mask"] for t in targets], dim=0)
+
+        semantic_deep_loss = []
+        for lvl, stride in enumerate(self.head_level_strides):
+            logit = aligned_trilinear(semantic_logits[lvl], tuple(map(int, stride.tolist())))
+            semantic_deep_loss.append(self.losses["semantic_segmentation"](logit, semantic_gt_mask))
+
+        f_logit = semantic_logits[-1]
+        if needs_upsample:
+            f_logit = aligned_trilinear(f_logit, inst_stride)
+        semantic_deep_loss.append(self.losses["semantic_segmentation"](f_logit, semantic_gt_mask))
+
+        semantic_deep_loss = torch.stack(semantic_deep_loss).mean()
         return {
             "instance_segmentation": instance_loss,
-            "semantic_segmentation": semantic_loss,
+            "semantic_segmentation": semantic_deep_loss,
         }
 
     def compute_loss(self, outputs, targets):
@@ -696,7 +717,10 @@ class CondInst3dPRL(pl.LightningModule):
             f_mask, head_features = self.backbone(input_chunk)
             cls_logits = self.classification_head(head_features)
             controller_logits = self.controller_head(head_features)
-            semantic_logits = self.semantic_head(f_mask)
+
+            semantic_logits = []
+            for si, f in enumerate(head_features + [f_mask]):
+                semantic_logits.append(self.semantic_heads[si](f))
 
             chunked_outputs.append({
                 "cls_logits": cls_logits,
@@ -707,9 +731,7 @@ class CondInst3dPRL(pl.LightningModule):
             })
 
         f_mask = torch.cat([c["f_mask"] for c in chunked_outputs], dim=0)
-        semantic_logits = torch.cat([c["semantic_logits"] for c in chunked_outputs], dim=0)
         f_mask = MetaTensor(f_mask, meta=input_meta)
-        semantic_logits = MetaTensor(semantic_logits, meta=input_meta)
 
         outputs = {
             "cls_logits": torch.cat([c["cls_logits"] for c in chunked_outputs], dim=0),
@@ -719,7 +741,10 @@ class CondInst3dPRL(pl.LightningModule):
                 torch.cat([c["features"][j] for c in chunked_outputs], dim=0)
                 for j in range(len(self.anchors_sizes))
             ],
-            "semantic_logits": semantic_logits,
+            "semantic_logits": [
+                torch.cat([c["semantic_logits"][j] for c in chunked_outputs], dim=0)
+                for j in range(len(self.anchors_sizes) + 1)
+            ],
             "offsets": offsets,
             "shape": shape,
             "spacing": spacing,

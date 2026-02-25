@@ -3,6 +3,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 from condinst3d.io.datamodule.nndet_result import nnDetectionResult
 from condinst3d.io.datamodule.nnunet_result import nnUNetResult
+from condinst3d.io.datamodule.condinst_result import CondInstResult
 from condinst3d.arch.model_evaluator import ModelEvaluator
 
 
@@ -65,17 +66,18 @@ def setup_logger(
 
 
 def main(
-        split_root = "/scratch/04/public_datasets/nnDet/Task100_PRL/raw_splitted",
-        n_modalities = 4,
-        pred_root = "/scratch/04/public_datasets/nnUNet_predictions"
+    pred_root,
+    split_root = "/scratch/04/public_datasets/nnDet/Task100_PRL/raw_splitted",
+    n_modalities = 4,
 ):
-    dm = nnUNetResult(split_root, pred_root, n_modalities, n_workers=32)
-    # dm = nnDetectionResult(split_root, pred_root, n_modalities, n_workers=32, score_threshold=0.5, iou_threshold=0.25)
+    # dm = nnUNetResult(split_root, pred_root, n_modalities, n_workers=32)
+    # dm = nnDetectionResult(split_root, pred_root, n_modalities, n_workers=32, score_threshold=0.1, iou_threshold=0.1)
+    dm = CondInstResult(split_root, pred_root, n_modalities, n_workers=32)
+
     model = ModelEvaluator(target_key="targets", pred_key="preds")
-    logger = setup_logger(name="nnUNet")
+    logger = setup_logger(name="CondInst3D")
     trainer = pl.Trainer(
         accelerator="gpu",
-        precision="bf16-mixed",
         devices=[0],
         logger=logger,
 
@@ -90,6 +92,8 @@ def main(
     trainer.test(model, datamodule=dm)
 
 if __name__ == "__main__":
-    main(
-        # pred_root="/scratch/01/ahrasoulian/projects/nnDetection/models/Task100_PRL/RetinaUNetV001_D3V001_3d/fold0/test_predictions"
-    )
+    nndet_pred_root = "/scratch/01/ahrasoulian/projects/nnDetection/models/Task100_PRL/RetinaUNetV001_D3V001_3d/fold0/test_predictions"
+    nnunet_pred_root = "/scratch/04/public_datasets/nnUNet_predictions"
+    condinst_pred_root = "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/condinst3d-prl-final/2026-02-21_00-58-25/tb/version_0/test_outputs"
+
+    main(condinst_pred_root)

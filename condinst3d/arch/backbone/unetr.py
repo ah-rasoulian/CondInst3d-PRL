@@ -18,6 +18,7 @@ class UNetR(UNetRBackboneBase):
         head_start_index,
         heads_dim,
         out_channels,
+        head_end_index = -1,
     ):
         # build encoder/decoder config + heads in base
         super().__init__(
@@ -28,6 +29,7 @@ class UNetR(UNetRBackboneBase):
             strides=strides,
             head_start_index=head_start_index,
             heads_dim=heads_dim,
+            head_end_index=head_end_index,
         )
 
         # modules

@@ -26,6 +26,7 @@ class UNetRBackboneBase(AbstractBackbone):
         strides,
         head_start_index: int,
         heads_dim: int,
+        head_end_index: int = -1,
     ):
         super().__init__()
         self._in_channels = in_channels
@@ -33,6 +34,7 @@ class UNetRBackboneBase(AbstractBackbone):
         self._heads_dim = heads_dim
         self._strides = strides
         self._head_start_index = head_start_index
+        self._head_end_index = head_end_index
         self._filters = filters
 
         self.kernels = kernels  # optional to expose if you want
@@ -67,6 +69,10 @@ class UNetRBackboneBase(AbstractBackbone):
         return self._head_start_index
 
     @property
+    def head_end_index(self) -> int:
+        return self._head_end_index
+
+    @property
     def filters(self):
         return self._filters
 
@@ -84,6 +90,8 @@ class UNetRBackboneBase(AbstractBackbone):
         modules: List[nn.Module | None] = []
         for i in range(len(self.filters)):
             if i < self.head_start_index:
+                conv = None
+            elif self.head_end_index != -1 and i > self.head_end_index:
                 conv = None
             else:
                 conv = nn.Conv3d(

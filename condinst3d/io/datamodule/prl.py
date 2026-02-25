@@ -124,16 +124,22 @@ class PRLDataModule(pl.LightningDataModule):
                 margin=4,
             ),
 
-            # concat modalities -> "inputs" with shape [C, H, W, D]
-            ConcatItemsd(keys=self.modalities, name="inputs", dim=0),
-
             # normalize input intensities
             MaskedPercentileNormalizeIntensityd(
-                keys=["inputs"],
+                keys=[x for x in self.modalities if x != "freqmap"],
                 mask_key="brain_mask",
                 percentiles=(0.5, 99.5),
-                channel_wise=True,
+                channel_wise=False,
             ),
+            MaskedPercentileNormalizeIntensityd(
+                keys=["freqmap"],
+                mask_key="brain_mask",
+                percentiles=(2, 98),
+                channel_wise=False,
+            ),
+
+            # concat modalities -> "inputs" with shape [C, H, W, D]
+            ConcatItemsd(keys=self.modalities, name="inputs", dim=0),
 
             # delete individual mods and brain_mask
             DeleteItemsd(keys=self.modalities + ["brain_mask"]),
@@ -274,11 +280,12 @@ class PRLDataModule(pl.LightningDataModule):
             val_transform += self._get_det_transforms()
             self.datasets['val'] = Dataset(data=self.cases['val'], transform=Compose(val_transform))
 
-        if stage in ["test", "predict"]:
+        # if stage in ["test", "predict"]:
             test_transform = self._get_load_transforms()
             test_transform += self._get_grid_patches_transforms()
             test_transform += self._get_det_transforms()
-            self.datasets[stage] = Dataset(data=self.cases['test'], transform=Compose(test_transform))
+            # self.datasets[stage] = Dataset(data=self.cases['test'], transform=Compose(test_transform))
+            self.datasets['test'] = Dataset(data=self.cases['test'], transform=Compose(test_transform))
 
     def transfer_batch_to_device(self, batch: Any, device: torch.device, dataloader_idx: int) -> Any:
         def move_iterable_to_device(iterable):
@@ -330,7 +337,8 @@ class PRLDataModule(pl.LightningDataModule):
         return self._get_dataloader(subset='train')
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
-        return self._get_dataloader(subset='val')
+        # return self._get_dataloader(subset='val')
+        return self._get_dataloader(subset='test')
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
         return self._get_dataloader(subset='test')

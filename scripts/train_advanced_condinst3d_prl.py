@@ -18,7 +18,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.strategies import DDPStrategy
 
 from condinst3d.io.datamodule.prl import PRLDataModule
-from condinst3d.arch.condinst3d_prl import CondInst3dPRL
+from condinst3d.arch.advanced_condinst3d_prl import AdvancedCondInst3dPRL
 try:
     import resource  # Unix only
 except Exception:
@@ -202,7 +202,7 @@ def setup_trainer(cfg: DictConfig, logger, callbacks) -> Trainer:
 
 
 # -------------------- main --------------------
-@hydra.main(config_path="../condinst3d/conf", config_name="condinst3d-prl-final", version_base=None)
+@hydra.main(config_path="../condinst3d/conf", config_name="condinst3d-prl-unetr", version_base=None)
 def main(cfg: DictConfig) -> None:
     # global setup from cfg.train
     _maybe_set_rlimit_nofile(int(getattr(cfg.train, "rlimit_nofile", 1048576)))
@@ -212,7 +212,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     # instantiate model/datamodule from config
-    model = CondInst3dPRL(cfg.model)
+    model = AdvancedCondInst3dPRL(cfg.model)
     dm = PRLDataModule(cfg.data)
 
     logger = setup_logger(cfg)
@@ -224,11 +224,8 @@ def main(cfg: DictConfig) -> None:
     ckpt_path = None
     if resume:
         ckpt_path = str(Path(resume).expanduser())
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt["state_dict"])
 
-    # trainer.fit(model=model, datamodule=dm, ckpt_path=ckpt_path)
-    trainer.validate(model=model, datamodule=dm)
+    trainer.fit(model=model, datamodule=dm, ckpt_path=ckpt_path, weights_only=False)
 
 
 if __name__ == "__main__":

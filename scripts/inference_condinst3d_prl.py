@@ -9,7 +9,7 @@ import os
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
-
+import json
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import TQDMProgressBar
@@ -56,6 +56,9 @@ def _as_list(x: Any) -> List[Any]:
 # -------------------- main --------------------
 @hydra.main(config_path="../condinst3d/conf", config_name="condinst3d-prl-final", version_base=None)
 def main(cfg: DictConfig) -> None:
+    ckpt_path = "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/condinst3d-prl-final/2026-02-21_00-58-25/tb/version_0/checkpoints/best_epoch=309-step=29450.ckpt"
+    hyper_param_path = "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/condinst3d-prl-final/2026-02-21_00-58-25/tb/version_0/hyperparams/validation_version_0-epoch=309det-params.json"
+
     # global setup from cfg.train
     _maybe_set_rlimit_nofile(int(getattr(cfg.train, "rlimit_nofile", 1048576)))
     _seed_everything(
@@ -65,20 +68,19 @@ def main(cfg: DictConfig) -> None:
 
     # instantiate model/datamodule from config
     model = CondInst3dPRL(cfg.model)
-    ckpt_path = "/scratch/01/ahrasoulian/projects/CondInst3d-PRL/scripts/outputs/condinst3d-prl-final/2026-02-21_00-58-25/tb/version_0/checkpoints/best_epoch=309-step=29450.ckpt"
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["state_dict"], strict=True)
+
+    hp_params = json.load(open(hyper_param_path, "r"))
     model.inference_hyperparams = {
-        "mask_thresh": 0.4688665405825742,
-        "score_thresh": 0.40114189214259616,
-        "nms_thresh": 0.4364592296874598,
-        "group_thresh": 0.2669170250188043,
-        "topk_candidates": 22,
+        "mask_thresh": hp_params["mask_thresh"],
+        "score_thresh": hp_params["score_thresh"],
+        "nms_thresh": hp_params["nms_thresh"],
+        "group_thresh": hp_params["group_thresh"],
+        "topk_candidates": hp_params["topk_candidates"],
     }
 
     dm = PRLDataModule(cfg.data)
-    dm.patch_overlap = 0.5311165433269576
-    dm.setup('test')
 
     trainer = pl.Trainer(
         accelerator="gpu",
