@@ -3,14 +3,14 @@ from __future__ import annotations
 from typing import Sequence
 
 from torch import Tensor
-from monai.networks.nets import UNETR
+from monai.networks.nets import SwinUNETR
 
 from .abstract import AbstractBackbone
 
 
-class UNETRBackbone(AbstractBackbone):
+class SwinUNETRBackbone(AbstractBackbone):
     """
-    UNETR backbone adapter for CondInst-style models.
+    SwinUNETR backbone adapter for CondInst-style models.
 
     Returned decoder_outputs are ordered:
         deep -> shallow
@@ -22,31 +22,31 @@ class UNETRBackbone(AbstractBackbone):
     -----
     - semantic_output is the final feature map BEFORE semantic logits.
     - heads are created only from decoder outputs in [head_start, head_end].
-    - the built-in UNETR segmentation head is kept as self.model.out, but your
-      CondInst model can ignore it and use its own semantic head.
+    - the built-in SwinUNETR segmentation head is kept as self.model.out, but
+      your CondInst model can ignore it and use its own semantic head.
     """
 
     def __init__(
         self,
         *,
+        img_size,
         in_channels: int,
         out_channels: int,
-        img_size,
         feature_size: int,
         heads_dim: int,
         head_start: int,
         head_end: int = -1,
-        hidden_size: int = 768,
-        mlp_dim: int = 3072,
-        num_heads: int = 12,
-        pos_embed: str = "conv",
+        depths: Sequence[int] = (2, 2, 2, 2),
+        num_heads: Sequence[int] = (3, 6, 12, 24),
         norm_name="instance",
-        conv_block: bool = True,
-        res_block: bool = True,
-        dropout_rate: float = 0.0,
+        drop_rate: float = 0.0,
+        attn_drop_rate: float = 0.0,
+        dropout_path_rate: float = 0.0,
+        normalize: bool = True,
+        use_checkpoint: bool = False,
         spatial_dims: int = 3,
-        qkv_bias: bool = False,
-        save_attn: bool = False,
+        downsample="merging",
+        use_v2: bool = False,
     ):
         super().__init__()
 
@@ -59,25 +59,27 @@ class UNETRBackbone(AbstractBackbone):
         self._head_start = int(head_start)
         self._head_end = int(head_end)
         self._feature_size = int(feature_size)
-        self._hidden_size = int(hidden_size)
         self._spatial_dims = int(spatial_dims)
 
-        # MONAI UNETR decoder channels from deep -> shallow:
-        # dec3 = feature_size * 8
-        # dec2 = feature_size * 4
-        # dec1 = feature_size * 2
-        # out  = feature_size
+        # SwinUNETR decoder channels from deep -> shallow, following MONAI:
+        # dec3 = 8 * feature_size
+        # dec2 = 4 * feature_size
+        # dec1 = 2 * feature_size
+        # dec0 = 1 * feature_size
+        # out  = 1 * feature_size
         self._decoder_feature_channels = [
             feature_size * 8,
             feature_size * 4,
             feature_size * 2,
             feature_size,
+            feature_size,
         ]
 
-        # UNETR uses patch size 16, and decoder upsamples by 2 each stage.
-        # Therefore decoder strides are naturally:
-        # 8, 4, 2, 1 (deep -> shallow), same on each axis.
+        # SwinUNETR uses patch_size=2 and 4 hierarchical downsamplings in the transformer,
+        # so the decoder feature strides are naturally:
+        # 16, 8, 4, 2, 1 (deep -> shallow).
         self._decoder_strides = [
+            (16, 16, 16),
             (8, 8, 8),
             (4, 4, 4),
             (2, 2, 2),
@@ -85,22 +87,22 @@ class UNETRBackbone(AbstractBackbone):
         ]
         self._semantic_stride = (1, 1, 1)
 
-        self.model = UNETR(
+        self.model = SwinUNETR(
+            img_size=img_size,
             in_channels=in_channels,
             out_channels=out_channels,
-            img_size=img_size,
-            feature_size=feature_size,
-            hidden_size=hidden_size,
-            mlp_dim=mlp_dim,
+            depths=depths,
             num_heads=num_heads,
-            pos_embed=pos_embed,
+            feature_size=feature_size,
             norm_name=norm_name,
-            conv_block=conv_block,
-            res_block=res_block,
-            dropout_rate=dropout_rate,
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+            dropout_path_rate=dropout_path_rate,
+            normalize=normalize,
+            use_checkpoint=use_checkpoint,
             spatial_dims=spatial_dims,
-            qkv_bias=qkv_bias,
-            save_attn=save_attn,
+            downsample=downsample,
+            use_v2=use_v2,
         )
 
         self._init_head_mappings()
@@ -151,10 +153,11 @@ class UNETRBackbone(AbstractBackbone):
         """
         return [
             self._feature_size,
+            self._feature_size,
             self._feature_size * 2,
             self._feature_size * 4,
             self._feature_size * 8,
-            self._hidden_size,
+            self._feature_size * 16,
         ]
 
     # ------------------------------------------------------------------
@@ -162,35 +165,34 @@ class UNETRBackbone(AbstractBackbone):
     # ------------------------------------------------------------------
 
     def forward_features(self, x: Tensor) -> tuple[Tensor, list[Tensor]]:
-        # MONAI UNETR forward pattern:
-        # x, hidden_states_out = vit(x)
-        # enc1 from input
-        # enc2, enc3, enc4 from hidden_states_out[3], [6], [9]
-        # dec4 = proj_feat(x)
-        # dec3 = decoder5(dec4, enc4)
+        # MONAI SwinUNETR forward pattern:
+        # hidden_states_out = swinViT(x, normalize)
+        # enc0 = encoder1(x)
+        # enc1 = encoder2(hidden_states_out[0])
+        # enc2 = encoder3(hidden_states_out[1])
+        # enc3 = encoder4(hidden_states_out[2])
+        # dec4 = encoder10(hidden_states_out[4])
+        # dec3 = decoder5(dec4, hidden_states_out[3])
         # dec2 = decoder4(dec3, enc3)
         # dec1 = decoder3(dec2, enc2)
-        # out  = decoder2(dec1, enc1)
-        x_vit, hidden_states_out = self.model.vit(x)
+        # dec0 = decoder2(dec1, enc1)
+        # out  = decoder1(dec0, enc0)
 
-        enc1 = self.model.encoder1(x)
+        hidden_states_out = self.model.swinViT(x, self.model.normalize)
 
-        x2 = hidden_states_out[3]
-        enc2 = self.model.encoder2(self.model.proj_feat(x2))
+        enc0 = self.model.encoder1(x)
+        enc1 = self.model.encoder2(hidden_states_out[0])
+        enc2 = self.model.encoder3(hidden_states_out[1])
+        enc3 = self.model.encoder4(hidden_states_out[2])
 
-        x3 = hidden_states_out[6]
-        enc3 = self.model.encoder3(self.model.proj_feat(x3))
-
-        x4 = hidden_states_out[9]
-        enc4 = self.model.encoder4(self.model.proj_feat(x4))
-
-        dec4 = self.model.proj_feat(x_vit)
-        dec3 = self.model.decoder5(dec4, enc4)
+        dec4 = self.model.encoder10(hidden_states_out[4])
+        dec3 = self.model.decoder5(dec4, hidden_states_out[3])
         dec2 = self.model.decoder4(dec3, enc3)
         dec1 = self.model.decoder3(dec2, enc2)
-        out = self.model.decoder2(dec1, enc1)
+        dec0 = self.model.decoder2(dec1, enc1)
+        out = self.model.decoder1(dec0, enc0)
 
-        decoder_outputs = [dec3, dec2, dec1, out]
+        decoder_outputs = [dec3, dec2, dec1, dec0, out]
         semantic_output = out
         return semantic_output, decoder_outputs
 
