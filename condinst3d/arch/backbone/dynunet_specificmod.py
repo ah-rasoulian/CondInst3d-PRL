@@ -41,6 +41,7 @@ class DynUNetBackboneSpecificMod(DynUNetBackbone):
         res_block: bool = False,
         trans_bias: bool = False,
         dropout=None,
+        enable_heads: bool = True,
     ):
         if spatial_dims != 3:
             raise ValueError("DynUNetBackboneSpecificMod supports only 3D inputs.")
@@ -64,6 +65,7 @@ class DynUNetBackboneSpecificMod(DynUNetBackbone):
             res_block=res_block,
             trans_bias=trans_bias,
             dropout=dropout,
+            enable_heads=enable_heads,
         )
 
         self.specific_modality_index = int(specific_modality_index)

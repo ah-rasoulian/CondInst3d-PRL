@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import List, Sequence, Optional
 
 import torch.nn as nn
 from torch import Tensor
@@ -25,10 +25,11 @@ class BackboneOutput:
     heads:
         Selected decoder outputs after passing through 1x1 conv head mappings,
         all mapped to heads_dim channels.
+        None when head features are disabled.
     """
     semantic_output: Tensor
     decoder_outputs: List[Tensor]
-    heads: List[Tensor]
+    heads: Optional[List[Tensor]] = None
 
 
 class AbstractBackbone(nn.Module, ABC):
@@ -52,8 +53,9 @@ class AbstractBackbone(nn.Module, ABC):
       3) projecting only selected decoder outputs to a common heads_dim
     """
 
-    def __init__(self):
+    def __init__(self, enable_heads: bool = True):
         super().__init__()
+        self.enable_heads = enable_heads
         self.head_mappings: nn.ModuleList | None = None
 
     # ------------------------------------------------------------------
@@ -179,6 +181,10 @@ class AbstractBackbone(nn.Module, ABC):
         Builds one 1x1 conv per selected decoder output so every selected
         decoder feature can be mapped to a common heads_dim.
         """
+        if not self.enable_heads:
+            self.head_mappings = None
+            return
+
         self.head_mappings = nn.ModuleList([
             nn.Conv3d(
                 in_channels=in_ch,
@@ -190,7 +196,13 @@ class AbstractBackbone(nn.Module, ABC):
             for in_ch in self.selected_decoder_feature_channels
         ])
 
-    def map_decoder_outputs_to_heads(self, decoder_outputs: List[Tensor]) -> List[Tensor]:
+    def map_decoder_outputs_to_heads(
+            self,
+            decoder_outputs: List[Tensor],
+    ) -> Optional[List[Tensor]]:
+        if not self.enable_heads:
+            return None
+
         if self.head_mappings is None:
             raise RuntimeError(
                 "head_mappings is not initialized. Call self._init_head_mappings() "

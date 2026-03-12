@@ -41,8 +41,9 @@ class SegResNetBackbone(AbstractBackbone):
         norm=("GROUP", {"num_groups": 8}),
         upsample_mode: str = "deconv",
         use_conv_final: bool = False,
+        enable_heads: bool = True,
     ):
-        super().__init__()
+        super().__init__(enable_heads=enable_heads)
 
         if spatial_dims not in (2, 3):
             raise ValueError(f"spatial_dims must be 2 or 3, got {spatial_dims}.")

@@ -47,8 +47,9 @@ class UNETRBackbone(AbstractBackbone):
         spatial_dims: int = 3,
         qkv_bias: bool = False,
         save_attn: bool = False,
+        enable_heads: bool = True,
     ):
-        super().__init__()
+        super().__init__(enable_heads=enable_heads)
 
         if spatial_dims != 3:
             raise ValueError(f"This wrapper currently expects spatial_dims=3, got {spatial_dims}.")
