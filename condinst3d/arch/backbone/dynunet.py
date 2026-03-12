@@ -48,8 +48,9 @@ class DynUNetBackbone(AbstractBackbone):
         res_block: bool = False,
         trans_bias: bool = False,
         dropout=None,
+        enable_heads: bool = True,
     ):
-        super().__init__()
+        super().__init__(enable_heads=enable_heads)
 
         self._in_channels = int(in_channels)
         self._out_channels = int(filters[0])  # semantic feature channels before output_block
