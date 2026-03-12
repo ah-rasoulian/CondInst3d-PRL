@@ -234,6 +234,16 @@ class AbstractBackbone(nn.Module, ABC):
         """
         pass
 
+    @abstractmethod
+    def forward_logits(self, semantic_output: Tensor) -> Tensor:
+        """
+        Returns
+        -------
+        semantic_logits:
+            Final semantic logits of shape [B, out_channels, ...].
+        """
+        pass
+
     def forward(self, x: Tensor) -> BackboneOutput:
         semantic_output, decoder_outputs = self.forward_features(x)
         heads = self.map_decoder_outputs_to_heads(decoder_outputs)
