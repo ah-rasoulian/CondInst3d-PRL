@@ -3,6 +3,13 @@ from __future__ import annotations
 from typing import Optional, Tuple
 import torch
 from torch import Tensor
+from skimage.filters import threshold_otsu
+from monai.data import MetaTensor
+import numpy as np
+from scipy import ndimage
+
+COMPUTE_DTYPE = torch.float32
+
 
 def relabel_sequential(mask: Tensor, exclude_background: bool = True) -> Tensor:
     """
@@ -181,3 +188,54 @@ def build_gt_cluster_ids(
         cluster_id += 1
 
     return gt_cluster_ids
+
+
+def connected_components(
+        binary_mask: Tensor,
+        connectivity: int = 26,
+) -> Tensor:
+    """
+    Connected components for a single 3D binary mask.
+
+    Parameters
+    ----------
+    binary_mask:
+        Bool or binary tensor of shape [H, W, D].
+
+    connectivity:
+        One of {6, 18, 26} for 3D connectivity.
+
+    Returns
+    -------
+    Tensor [H, W, D] of dtype long, where:
+      - 0 is background
+      - 1..K are connected component ids
+    """
+    if binary_mask.ndim != 3:
+        raise ValueError(
+            f"connected_components expects a 3D tensor [H,W,D], got shape {tuple(binary_mask.shape)}"
+        )
+
+    binary_mask_np = binary_mask.detach().to(dtype=torch.bool, device="cpu").numpy()
+
+    if connectivity == 6:
+        structure = ndimage.generate_binary_structure(rank=3, connectivity=1)
+    elif connectivity == 18:
+        # scipy does not expose “18” directly as a named mode; this structure works for it
+        structure = ndimage.generate_binary_structure(rank=3, connectivity=2)
+        structure[0, 0, 0] = 0
+        structure[0, 0, 2] = 0
+        structure[0, 2, 0] = 0
+        structure[0, 2, 2] = 0
+        structure[2, 0, 0] = 0
+        structure[2, 0, 2] = 0
+        structure[2, 2, 0] = 0
+        structure[2, 2, 2] = 0
+    elif connectivity == 26:
+        structure = np.ones((3, 3, 3), dtype=np.uint8)
+    else:
+        raise ValueError(f"connectivity must be one of {{6,18,26}}, got {connectivity}")
+
+    labeled_np, _ = ndimage.label(binary_mask_np, structure=structure)
+
+    return torch.as_tensor(labeled_np, device=binary_mask.device, dtype=torch.long)
