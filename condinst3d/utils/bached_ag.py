@@ -84,65 +84,135 @@ def _find_connected_components(grouped: torch.Tensor):
 
 
 @torch.no_grad()
-def merge_prediction(
+def merge_patch_prediction(
     det: Dict[str, Tensor],
     output_shape: Tuple[int, int, int],
     mask_thresh: float,
+    group_iom_thresh: float,
+    iom_chunk: int = 128,
 ) -> Dict[str, Tensor]:
     """
-    Group if:
-      (1) close anchor centers (per-axis |d| < threshold derived from strides), AND
+    Merge patch-level duplicate detections into full-image instance candidates.
 
-    Output `onehot_prob` is [G,X,Y,Z] bool.
+    Expected input keys
+    -------------------
+    det["anchor_centers"] : [M, 3]
+    det["anchor_strides"] : [M, 3]
+    det["classes"]        : [M]
+    det["scores"]         : [M]
+    det["onehot_logits"]  : [M, 1, px, py, pz] or [M, px, py, pz]
+    det["offsets"]        : [M, 3]
+
+    Returns
+    -------
+    dict with:
+      - anchor_centers : [G, 3]
+      - anchor_strides : [G, 3]
+      - classes        : [G]
+      - scores         : [G]
+      - onehot_prob    : [G, 1, X, Y, Z]
     """
+    X, Y, Z = output_shape
+    device = det["scores"].device
 
-    # -------------------- empty --------------------
-    if det["scores"].numel() == 0:
-        X, Y, Z = output_shape
-        device = det["anchor_centers"].device
+    def _empty_output() -> Dict[str, Tensor]:
         return {
-            "anchor_centers": det["anchor_centers"].reshape(0, 3),
-            "anchor_strides": det["anchor_strides"].reshape(0, 3),
-            "classes": det["classes"].reshape(0),
-            "scores": det["scores"].reshape(0),
-            "onehot_prob": torch.zeros((0, X, Y, Z), dtype=torch.bool, device=device),
+            "anchor_centers": torch.empty((0, 3), device=device, dtype=det["anchor_centers"].dtype),
+            "anchor_strides": torch.empty((0, 3), device=device, dtype=det["anchor_strides"].dtype),
+            "classes": torch.empty((0,), device=device, dtype=torch.long),
+            "scores": torch.empty((0,), device=device, dtype=det["scores"].dtype),
+            "onehot_prob": torch.zeros((0, 1, X, Y, Z), device=device, dtype=torch.float32),
         }
-    onehot_probs = torch.sigmoid(det["onehot_logits"])
+
+    # -------------------- empty input --------------------
+    if det["scores"].numel() == 0:
+        return _empty_output()
+
+    scores = det["scores"].reshape(-1)
+    classes = det["classes"].to(torch.long).reshape(-1)
     offsets = det["offsets"]
 
+    onehot_probs = torch.sigmoid(det["onehot_logits"])
+    if onehot_probs.ndim == 4:
+        onehot_probs = onehot_probs.unsqueeze(1)  # [M,1,px,py,pz]
+
+    # -------------------- paste patch probabilities to global --------------------
     onehot_probs_gb = torch.stack([
-        _place_patch_mask_into_global(oh, _as_int_offset(of), output_shape) for oh, of in zip(onehot_probs, offsets)
-    ])
-    onehot_probs_gb = onehot_probs_gb.unsqueeze(1)
+        _place_patch_mask_into_global(oh, _as_int_offset(of), output_shape)
+        for oh, of in zip(onehot_probs, offsets)
+    ], dim=0)
 
-    bboxes = get_onehot_instance_mask_boxes(onehot_probs_gb >= mask_thresh)
-    centers = (bboxes[:, :3] + bboxes[:, 3:]) / 2
-    strides = (bboxes[:, 3:] - bboxes[:, :3])
-    anchor_centers = det["anchor_centers"] + offsets
-    anchor_strides = det["anchor_strides"]
-    scores  = det["scores"]
-    classes = det["classes"]
+    if onehot_probs_gb.ndim == 4:
+        onehot_probs_gb = onehot_probs_gb.unsqueeze(1)  # [M,1,X,Y,Z]
 
-    # Step 1: Group nearby predictions (within stride distance) and Prevent large lesions from absorbing small lesions
+    onehot_probs_gb = onehot_probs_gb.to(torch.float32)
+
+    # threshold only for geometry / grouping decisions
+    onehot_bin_gb = onehot_probs_gb >= float(mask_thresh)  # [M,1,X,Y,Z] bool
+
+    # -------------------- remove empty masks early --------------------
+    keep_nonempty = onehot_bin_gb[:, 0].flatten(1).any(dim=1)
+    if not keep_nonempty.any():
+        return _empty_output()
+
+    scores = scores[keep_nonempty]
+    classes = classes[keep_nonempty]
+    offsets = offsets[keep_nonempty]
+    onehot_probs_gb = onehot_probs_gb[keep_nonempty]
+    onehot_bin_gb = onehot_bin_gb[keep_nonempty]
+    anchor_centers = det["anchor_centers"][keep_nonempty] + offsets
+    anchor_strides = det["anchor_strides"][keep_nonempty]
+
+    M = int(scores.numel())
+    if M == 0:
+        return _empty_output()
+
+    # geometry from thresholded full-image masks
+    bboxes = get_onehot_instance_mask_boxes(onehot_bin_gb)  # [M,6]
+    centers = (bboxes[:, :3] + bboxes[:, 3:]) / 2.0
+    strides = (bboxes[:, 3:] - bboxes[:, :3]).clamp_min(1.0)
+
+    if M == 1:
+        return {
+            "anchor_centers": anchor_centers,
+            "anchor_strides": anchor_strides,
+            "classes": classes,
+            "scores": scores,
+            "onehot_prob": onehot_probs_gb,
+        }
+
+    # -------------------- Step 1: coarse grouping by proximity --------------------
     pairwise_anchor_dist = (anchor_centers[None] - anchor_centers[:, None]).abs()
     pairwise_center_dist = (centers[None] - centers[:, None]).abs()
-    max_anchor_dist = (anchor_strides[None] + anchor_strides[:, None]) / 2
-    max_center_dist = (strides[None] + strides[:, None]) / 2
+
+    max_anchor_dist = (anchor_strides[None] + anchor_strides[:, None]) / 2.0
+    max_center_dist = (strides[None] + strides[:, None]) / 2.0
+
     is_anchors_close = torch.all(pairwise_anchor_dist < max_anchor_dist, dim=-1)
     is_anchors_neighbor = torch.all(pairwise_anchor_dist <= max_anchor_dist, dim=-1)
-
     is_centers_close = torch.all(pairwise_center_dist < max_center_dist, dim=-1)
+
     is_close = is_anchors_close | (is_anchors_neighbor & is_centers_close)
 
     max_ratio = 1.5
-    anchor_stride_ratio = (torch.max(anchor_strides[None], anchor_strides[:, None]) /
-                           torch.min(anchor_strides[None], anchor_strides[:, None]))
+    anchor_stride_ratio = (
+        torch.maximum(anchor_strides[None], anchor_strides[:, None]) /
+        torch.minimum(
+            anchor_strides[None].clamp_min(1e-6),
+            anchor_strides[:, None].clamp_min(1e-6),
+        )
+    )
     same_scale = torch.all(anchor_stride_ratio < max_ratio, dim=-1)
 
-
-    # Step 2: Combine grouping conditions
     proximity_grouped = is_close & same_scale
-    components = _find_connected_components(proximity_grouped)
+    proximity_grouped = proximity_grouped & (classes[None] == classes[:, None])
+    proximity_grouped.fill_diagonal_(True)
+
+    coarse_components = _find_connected_components(proximity_grouped)
+
+    # -------------------- Step 2: refine each coarse group by IoM --------------------
+    flat = onehot_bin_gb[:, 0].flatten(1)              # [M,V] bool
+    area = flat.sum(dim=1).to(torch.float32)           # [M]
 
     out = {
         "anchor_centers": [],
@@ -151,27 +221,69 @@ def merge_prediction(
         "scores": [],
         "onehot_prob": [],
     }
-    for group_indices in components:
-        group_anchor_centers = anchor_centers[group_indices]
-        group_anchor_strides = anchor_strides[group_indices]
-        group_classes = classes[group_indices]
-        group_scores = scores[group_indices]
-        group_onehot_probs = onehot_probs_gb[group_indices]
 
-        weights = torch.softmax(group_scores, dim=0)
-        group_mask = (group_onehot_probs * weights.view(-1, 1, 1, 1, 1)).sum(dim=0) / weights.sum()
+    for group in coarse_components:
+        if len(group) == 1:
+            idx = int(group[0])
+            out["anchor_centers"].append(anchor_centers[idx])
+            out["anchor_strides"].append(anchor_strides[idx])
+            out["classes"].append(classes[idx])
+            out["scores"].append(scores[idx])
+            out["onehot_prob"].append(onehot_probs_gb[idx])
+            continue
 
-        out['anchor_centers'] += [group_anchor_centers.mean(dim=0)]
-        out['anchor_strides'] += [group_anchor_strides.mean(dim=0)]
-        out['classes'] += [torch.mode(group_classes)[0]]
-        out['scores'] += [group_scores.mean()]
-        out['onehot_prob'] += [group_mask]
+        gi = torch.as_tensor(group, device=device, dtype=torch.long)
+        k = int(gi.numel())
 
-    for key in out:
-        out[key] = torch.stack(out[key])
+        adj = torch.eye(k, device=device, dtype=torch.bool)
+        ii, jj = torch.triu_indices(k, k, offset=1, device=device)
 
-    return out
+        for s in range(0, ii.numel(), iom_chunk):
+            a = ii[s:s + iom_chunk]
+            b = jj[s:s + iom_chunk]
 
+            mi = flat[gi[a]]  # [B,V]
+            mj = flat[gi[b]]  # [B,V]
+
+            inter = (mi & mj).sum(dim=1).to(torch.float32)
+            denom = torch.minimum(area[gi[a]], area[gi[b]]).clamp_min(1.0)
+            iom = inter / denom
+
+            keep_edge = iom >= float(group_iom_thresh)
+            if keep_edge.any():
+                aa = a[keep_edge]
+                bb = b[keep_edge]
+                adj[aa, bb] = True
+                adj[bb, aa] = True
+
+        refined_local_components = _find_connected_components(adj)
+
+        # -------------------- reduce each refined component to one merged instance --------------------
+        for comp_local in refined_local_components:
+            li = torch.as_tensor(comp_local, device=device, dtype=torch.long)
+            idxs = gi[li]
+
+            best_idx = idxs[torch.argmax(scores[idxs])]
+
+            # max-fusion preserves support across duplicates without blurring
+            group_prob = onehot_probs_gb[idxs].max(dim=0).values  # [1,X,Y,Z]
+
+            out["anchor_centers"].append(anchor_centers[best_idx])
+            out["anchor_strides"].append(anchor_strides[best_idx])
+            out["classes"].append(classes[best_idx])
+            out["scores"].append(scores[best_idx])
+            out["onehot_prob"].append(group_prob)
+
+    if len(out["scores"]) == 0:
+        return _empty_output()
+
+    return {
+        "anchor_centers": torch.stack(out["anchor_centers"], dim=0),
+        "anchor_strides": torch.stack(out["anchor_strides"], dim=0),
+        "classes": torch.stack(out["classes"], dim=0),
+        "scores": torch.stack(out["scores"], dim=0),
+        "onehot_prob": torch.stack(out["onehot_prob"], dim=0),
+    }
 
 def batched_nms(
     preds: Tensor,
@@ -229,3 +341,70 @@ def batched_nms(
         order = rest[~suppress]
 
     return torch.stack(keep).to(dtype=torch.long)
+
+
+def merge_semantic_logits(
+        patch_logits: List[Tensor],
+        patch_offsets: List[Tensor],
+        output_shape: tuple[int, int, int],
+) -> Tensor:
+    """
+    Merge semantic patch logits into one full-size logit volume by averaging overlaps.
+    Safely handles boundary patches by clipping to output_shape.
+    """
+    if len(patch_logits) != len(patch_offsets):
+        raise ValueError(
+            f"patch_logits and patch_offsets must have same length, got "
+            f"{len(patch_logits)} and {len(patch_offsets)}."
+        )
+
+    if len(output_shape) != 3:
+        raise ValueError(f"output_shape must be length 3, got {output_shape}")
+
+    if len(patch_logits) == 0:
+        raise ValueError("patch_logits must not be empty.")
+
+    device = patch_logits[0].device
+    dtype = patch_logits[0].dtype
+
+    merged = torch.zeros((1, *output_shape), device=device, dtype=dtype)
+    counts = torch.zeros((1, *output_shape), device=device, dtype=dtype)
+
+    for logit_patch, offset in zip(patch_logits, patch_offsets):
+        if logit_patch.ndim == 3:
+            logit_patch = logit_patch.unsqueeze(0)
+        elif logit_patch.ndim != 4:
+            raise ValueError(
+                f"Each patch logit must have shape [H,W,D] or [1,H,W,D], got {tuple(logit_patch.shape)}"
+            )
+
+        if logit_patch.shape[0] != 1:
+            raise ValueError(
+                f"Expected a single semantic channel, got patch shape {tuple(logit_patch.shape)}"
+            )
+
+        offset = offset.to(device=device, dtype=torch.long).view(-1)
+        if offset.numel() != 3:
+            raise ValueError(f"Each patch offset must have 3 values, got shape {tuple(offset.shape)}")
+
+        h0, w0, d0 = offset.tolist()
+        _, ph, pw, pd = logit_patch.shape
+
+        h1 = min(h0 + ph, output_shape[0])
+        w1 = min(w0 + pw, output_shape[1])
+        d1 = min(d0 + pd, output_shape[2])
+
+        if h0 >= h1 or w0 >= w1 or d0 >= d1:
+            continue
+
+        use_h = h1 - h0
+        use_w = w1 - w0
+        use_d = d1 - d0
+
+        patch_crop = logit_patch[:, :use_h, :use_w, :use_d]
+
+        merged[:, h0:h1, w0:w1, d0:d1] += patch_crop
+        counts[:, h0:h1, w0:w1, d0:d1] += 1
+
+    counts = torch.clamp(counts, min=1)
+    return merged / counts
