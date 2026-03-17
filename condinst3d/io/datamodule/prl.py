@@ -1,5 +1,5 @@
 from typing import Any, Optional
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import pytorch_lightning as pl
 import torch
 from monai.data import Dataset
@@ -11,15 +11,15 @@ import os
 from monai.transforms import (
     Compose,
     LoadImaged, Lambdad, EnsureChannelFirstd, EnsureTyped, ConcatItemsd, DeleteItemsd, CropForegroundd,
-    RandWeightedCropd, RandSpatialCropd, GridPatchd,
+    RandWeightedCropd, GridPatchd,
     RandRotated, RandZoomd, RandFlipd, OneOf, RandGaussianNoised,
     RandScaleIntensityd, RandShiftIntensityd, RandAdjustContrastd, CopyItemsd,
-    CenterSpatialCropd,
+    CenterSpatialCropd, SpatialPadd,
 )
 import numpy as np
 from condinst3d.io.transforms import (
     MaskedPercentileNormalizeIntensityd, InstanceMaskToDetd,
-    MakeBalancedInstanceWeightMapd, SpatialPadWithMind, SymmetricGridPad
+    MakeBalancedInstanceWeightMapd, SymmetricGridPad
 )
 from condinst3d.io.collate import multi_instance_collate
 from functools import partial
@@ -82,7 +82,6 @@ class PRLDataModule(pl.LightningDataModule):
         self.batch_size = cfg.batch_size
 
         self.patch_size = tuple(cfg.patch_size)
-        self.patches_per_subject = int(cfg.patches_per_subject)
         self.patch_overlap = float(cfg.patch_overlap)
 
         self.spatial_augmentation_prob = float(cfg.spatial_augmentation_prob)
@@ -118,7 +117,8 @@ class PRLDataModule(pl.LightningDataModule):
             train_counts.append(n_inst)
 
         empty_weight = float(getattr(cfg, "empty_case_weight", 0.2))
-        power = float(getattr(cfg, "instance_weight_power", 0.7))
+        power = float(getattr(cfg, "instance_weight_power", 0.5))
+        max_case_weight = float(getattr(cfg, "max_case_weight", 3.0))
         eps = 1e-6
 
         self.train_weights = []
@@ -126,9 +126,10 @@ class PRLDataModule(pl.LightningDataModule):
             if n == 0:
                 w = empty_weight
             else:
-                w = float((n + eps) ** power)
-            self.train_weights.append(w)
+                w = min((n + eps) ** power, max_case_weight)
+            self.train_weights.append(float(w))
 
+        self.train_num_samples = int(getattr(cfg, "train_num_samples", len(train_df)))
     # --------------------------------------------------
     # transforms
     # --------------------------------------------------
@@ -175,7 +176,7 @@ class PRLDataModule(pl.LightningDataModule):
                 range_y=0.0,
                 range_z=np.pi / 12,
                 prob=self.spatial_augmentation_prob,
-                keep_size=False,
+                keep_size=True,
                 mode=["bilinear", "nearest", "nearest"],
             ),
             RandZoomd(
@@ -184,7 +185,7 @@ class PRLDataModule(pl.LightningDataModule):
                 min_zoom=(0.9, 0.9, 1.0),
                 max_zoom=(1.1, 1.1, 1.0),
                 mode=["bilinear", "nearest", "nearest"],
-                keep_size=False,
+                keep_size=True,
             ),
             RandFlipd(
                 keys=keys_all,
@@ -222,21 +223,17 @@ class PRLDataModule(pl.LightningDataModule):
             RandWeightedCropd(
                 keys=["inputs", "instance_mask", "semantic_mask"],
                 w_key="inst_wmap",
-                spatial_size=np.array(self.patch_size) * 1.5,
-                num_samples=self.patches_per_subject,
-            ),
-
-            RandSpatialCropd(
-                keys=["inputs", "instance_mask", "semantic_mask"],
-                roi_size=self.patch_size,
-                random_center=True,
-            ),
-
-            SpatialPadWithMind(
-                keys=["inputs", "instance_mask", "semantic_mask"],
-                mask_keys=["instance_mask", "semantic_mask"],
                 spatial_size=self.patch_size,
+                num_samples=1,
             ),
+
+            SpatialPadd(
+                keys=["inputs", "instance_mask", "semantic_mask"],
+                spatial_size=self.patch_size,
+                method="symmetric",
+                mode="constant",
+                value=0,
+            )
         ]
 
     def _get_grid_patches_transforms(self):
@@ -265,10 +262,12 @@ class PRLDataModule(pl.LightningDataModule):
         return [
             CopyItemsd(keys=["inputs"], times=1, names=["inputs_orig"]),
 
-            SpatialPadWithMind(
+            SpatialPadd(
                 keys=["inputs", "inputs_orig", "instance_mask", "semantic_mask"],
-                mask_keys=["instance_mask", "semantic_mask"],
                 spatial_size=self.full_image_size,
+                method="symmetric",
+                mode="constant",
+                value=0,
             ),
 
             CenterSpatialCropd(
@@ -286,25 +285,27 @@ class PRLDataModule(pl.LightningDataModule):
         ]
 
     def _build_split_transform(
-        self,
-        *,
-        split: str,
-        image_mode: str,
-        with_augmentation: bool,
+            self,
+            *,
+            split: str,
+            image_mode: str,
+            with_augmentation: bool,
     ):
         tfm = []
         tfm += self._get_load_transforms()
 
-        if with_augmentation:
-            tfm += self._get_augmentation_transforms()
-
         if image_mode == "patch":
             if split == "train":
                 tfm += self._get_center_patches_transforms()
+                if with_augmentation:
+                    tfm += self._get_augmentation_transforms()
             else:
                 tfm += self._get_grid_patches_transforms()
+
         elif image_mode == "full":
             tfm += self._get_full_image_transforms()
+            if split == "train" and with_augmentation:
+                tfm += self._get_augmentation_transforms()
         else:
             raise ValueError(f"Unknown image_mode={image_mode!r}")
 
@@ -398,16 +399,29 @@ class PRLDataModule(pl.LightningDataModule):
     # --------------------------------------------------
     def _get_dataloader(self, subset: str):
         dataset = self.datasets[subset]
-        shuffle = subset == "train"
+
+        sampler = None
+        shuffle = False
+
+        if subset == "train":
+            sampler = WeightedRandomSampler(
+                weights=torch.as_tensor(self.train_weights, dtype=torch.double),
+                num_samples=getattr(self, "train_num_samples", len(self.cases["train"])),
+                replacement=True,
+            )
+        else:
+            shuffle = False
 
         return DataLoader(
             dataset=dataset,
             batch_size=self.batch_size[subset],
-            shuffle=shuffle,
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
             num_workers=self.num_workers[subset],
             collate_fn=self.collate_fn,
             pin_memory=True,
             persistent_workers=(self.num_workers[subset] > 0),
+            drop_last=(subset == "train"),
         )
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
