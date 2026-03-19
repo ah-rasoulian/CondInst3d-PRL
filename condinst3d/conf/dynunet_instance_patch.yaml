@@ -26,6 +26,7 @@ train:
   lr_logging_interval: "step"
 
   ddp_backend: "nccl"
+  find_unused_parameters: true
 
   trainer:
     accelerator: gpu
@@ -164,7 +165,7 @@ model:
 
 data:
   image_mode: patch   # patch or full
-  full_image_size: [192, 224, 72]
+  full_image_size: [192, 256, 72]
 
   root_path: "/scratch/04/public_datasets/nnDet/Task101_PRL"
   fold: 0

@@ -122,7 +122,7 @@ model:
 
 data:
   image_mode: patch
-  full_image_size: [192, 224, 72]
+  full_image_size: [192, 256, 72]
 
   root_path: "/scratch/04/public_datasets/nnDet/Task101_PRL"
   fold: 0
