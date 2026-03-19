@@ -135,7 +135,36 @@ class InstanceList:
         if max_samples < 0 or max_samples >= n:
             return torch.arange(n, device=self.device)
 
-        return torch.randperm(n, device=self.device)[:max_samples]
+        if (self.gt_idx < 0).all():
+            return torch.randperm(n, device=self.device)[:max_samples]
+
+        device = self.device
+        key = torch.stack([self.img_idx, self.gt_idx], dim=1)
+        unique_keys, inverse = torch.unique(key, dim=0, return_inverse=True)
+
+        chosen = []
+        for g in range(unique_keys.shape[0]):
+            idx = torch.nonzero(inverse == g, as_tuple=False).flatten()
+            pick = idx[torch.randint(idx.numel(), (1,), device=device)[0]]
+            chosen.append(pick)
+
+        chosen = torch.stack(chosen)
+
+        if chosen.numel() >= max_samples:
+            perm = torch.randperm(chosen.numel(), device=device)
+            return chosen[perm[:max_samples]]
+
+        selected_mask = torch.zeros(n, device=device, dtype=torch.bool)
+        selected_mask[chosen] = True
+
+        leftover = torch.nonzero(~selected_mask, as_tuple=False).flatten()
+        need = max_samples - chosen.numel()
+        if need > 0 and leftover.numel() > 0:
+            perm = torch.randperm(leftover.numel(), device=device)
+            fill = leftover[perm[:need]]
+            chosen = torch.cat([chosen, fill], dim=0)
+
+        return chosen
 
     def __len__(self):
         return self.sample_idx.numel()
