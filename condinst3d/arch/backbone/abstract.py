@@ -19,8 +19,10 @@ class BackboneOutput:
         Final high-resolution semantic feature map returned by the backbone.
 
     decoder_outputs:
-        All raw decoder feature maps returned by the semantic model, in a fixed
-        order defined by the backbone implementation.
+        All raw decoder feature maps returned by the semantic model, ordered
+        from shallow -> deep:
+            - decoder_outputs[0] is the highest-resolution / smallest-stride level
+            - decoder_outputs[-1] is the lowest-resolution / largest-stride level
 
     heads:
         Selected decoder outputs after passing through 1x1 conv head mappings,
@@ -43,9 +45,7 @@ class AbstractBackbone(nn.Module, ABC):
       - decoder_feature_channels: channels of all raw decoder outputs
       - decoder_strides: strides of all raw decoder outputs w.r.t. input
       - semantic_stride: stride of semantic_output w.r.t. input
-      - head_start: first decoder level used for head mappings
-      - head_end: last decoder level used for head mappings, inclusive
-                  if -1, use until the last decoder level
+      - head_indices: decoder levels used for head mappings
 
     The backbone is responsible for:
       1) producing all raw decoder outputs
@@ -89,6 +89,11 @@ class AbstractBackbone(nn.Module, ABC):
         """
         Channels of all raw decoder outputs, in the same order as returned by
         forward_features().
+
+        Convention:
+            shallow -> deep
+            index 0 = highest resolution / smallest stride
+            last index = lowest resolution / largest stride
         """
         pass
 
@@ -98,6 +103,11 @@ class AbstractBackbone(nn.Module, ABC):
         """
         Spatial strides of all raw decoder outputs w.r.t. the input image,
         in the same order as decoder_feature_channels / decoder_outputs.
+
+        Convention:
+            shallow -> deep
+            index 0 = smallest stride / highest resolution
+            last index = largest stride / lowest resolution
         """
         pass
 
@@ -105,24 +115,18 @@ class AbstractBackbone(nn.Module, ABC):
     @abstractmethod
     def semantic_stride(self) -> Sequence[int]:
         """
-        Spatial stride of semantic_output w.r.t. the input image.
+        Spatial stride of semantic_output w.r.t. input image.
         """
         pass
 
     @property
     @abstractmethod
-    def head_start(self) -> int:
+    def head_indices(self) -> Sequence[int]:
         """
-        First decoder output index to use for head mappings.
-        """
-        pass
+        Decoder output indices to use for head mappings.
 
-    @property
-    @abstractmethod
-    def head_end(self) -> int:
-        """
-        Last decoder output index to use for head mappings, inclusive.
-        If -1, uses up to the final decoder output.
+        Indexing convention:
+            shallow -> deep
         """
         pass
 
@@ -138,39 +142,35 @@ class AbstractBackbone(nn.Module, ABC):
         return len(self.decoder_feature_channels)
 
     @property
-    def resolved_head_end(self) -> int:
-        return self.num_decoder_levels - 1 if self.head_end == -1 else self.head_end
+    def resolved_head_indices(self) -> List[int]:
+        indices = list(self.head_indices)
 
-    @property
-    def head_indices(self) -> List[int]:
-        end = self.resolved_head_end
-        if not (0 <= self.head_start < self.num_decoder_levels):
-            raise ValueError(
-                f"head_start={self.head_start} is out of range for "
-                f"{self.num_decoder_levels} decoder levels."
-            )
-        if not (0 <= end < self.num_decoder_levels):
-            raise ValueError(
-                f"head_end={self.head_end} resolves to {end}, which is out of range "
-                f"for {self.num_decoder_levels} decoder levels."
-            )
-        if self.head_start > end:
-            raise ValueError(
-                f"head_start={self.head_start} must be <= resolved head_end={end}."
-            )
-        return list(range(self.head_start, end + 1))
+        if len(indices) == 0:
+            raise ValueError("head_indices must contain at least one decoder level.")
+
+        for idx in indices:
+            if not (0 <= idx < self.num_decoder_levels):
+                raise ValueError(
+                    f"head index {idx} is out of range for "
+                    f"{self.num_decoder_levels} decoder levels."
+                )
+
+        if len(set(indices)) != len(indices):
+            raise ValueError(f"head_indices contains duplicates: {indices}")
+
+        return indices
 
     @property
     def head_feature_channels(self) -> List[int]:
-        return [self.heads_dim] * len(self.head_indices)
+        return [self.heads_dim] * len(self.resolved_head_indices)
 
     @property
     def head_strides(self) -> List[Sequence[int]]:
-        return [self.decoder_strides[i] for i in self.head_indices]
+        return [self.decoder_strides[i] for i in self.resolved_head_indices]
 
     @property
     def selected_decoder_feature_channels(self) -> List[int]:
-        return [self.decoder_feature_channels[i] for i in self.head_indices]
+        return [self.decoder_feature_channels[i] for i in self.resolved_head_indices]
 
     # ------------------------------------------------------------------
     # Shared implementation
@@ -197,8 +197,8 @@ class AbstractBackbone(nn.Module, ABC):
         ])
 
     def map_decoder_outputs_to_heads(
-            self,
-            decoder_outputs: List[Tensor],
+        self,
+        decoder_outputs: List[Tensor],
     ) -> Optional[List[Tensor]]:
         if not self.enable_heads:
             return None
@@ -215,7 +215,7 @@ class AbstractBackbone(nn.Module, ABC):
                 f"got {len(decoder_outputs)}."
             )
 
-        selected_decoder_outputs = [decoder_outputs[i] for i in self.head_indices]
+        selected_decoder_outputs = [decoder_outputs[i] for i in self.resolved_head_indices]
 
         if len(selected_decoder_outputs) != len(self.head_mappings):
             raise ValueError(
@@ -239,10 +239,17 @@ class AbstractBackbone(nn.Module, ABC):
         -------
         semantic_output:
             Final semantic feature map of shape [B, out_channels, ...].
+            This should be the highest-resolution decoder feature map before
+            semantic logits.
 
         decoder_outputs:
             List of all raw decoder outputs in a fixed order defined by the
             concrete backbone.
+
+            Convention:
+                shallow -> deep
+                decoder_outputs[0] is highest resolution / smallest stride
+                decoder_outputs[-1] is lowest resolution / largest stride
         """
         pass
 

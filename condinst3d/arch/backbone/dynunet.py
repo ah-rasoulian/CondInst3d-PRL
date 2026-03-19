@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import List, Sequence
 
-import torch.nn as nn
 from torch import Tensor
 from monai.networks.nets import DynUNet
 
@@ -13,15 +12,10 @@ class DynUNetBackbone(AbstractBackbone):
     """
     DynUNet backbone adapter for CondInst-style models.
 
-    This backbone:
-      - runs a MONAI DynUNet semantic model
-      - returns all decoder outputs
-      - returns the final semantic feature map before semantic logits
-      - maps only decoder outputs in [head_start, head_end] to heads_dim via 1x1 convs
-
-    Expected decoder_outputs order:
-      deep -> shallow
-      decoder_outputs[-1] is the highest-resolution decoder feature map
+    Public convention:
+      - decoder_outputs are ordered shallow -> deep
+      - decoder_outputs[0] is the highest-resolution decoder feature map
+      - decoder_outputs[-1] is the lowest-resolution decoder feature map
 
     semantic_output:
       highest-resolution decoder feature map before DynUNet's final output_block
@@ -39,8 +33,7 @@ class DynUNetBackbone(AbstractBackbone):
         filters,
         heads_dim: int,
         decoder_strides: Sequence[Sequence[int]],
-        head_start: int,
-        head_end: int = -1,
+        head_indices: Sequence[int],
         norm_name=("INSTANCE", {"affine": True}),
         act_name=("leakyrelu", {"inplace": True, "negative_slope": 0.01}),
         deep_supervision: bool = False,
@@ -53,13 +46,16 @@ class DynUNetBackbone(AbstractBackbone):
         super().__init__(enable_heads=enable_heads)
 
         self._in_channels = int(in_channels)
-        self._out_channels = int(filters[0])  # semantic feature channels before output_block
+        self._out_channels = int(filters[0])
         self._heads_dim = int(heads_dim)
-        self._decoder_feature_channels = list(filters[:-1])[::-1]  # deep -> shallow
+
+        # Public convention: shallow -> deep
+        self._decoder_feature_channels = list(filters[:-1])
         self._decoder_strides = [tuple(s) for s in decoder_strides]
-        self._semantic_stride = tuple(self._decoder_strides[-1])
-        self._head_start = int(head_start)
-        self._head_end = int(head_end)
+        self._semantic_stride = tuple(self._decoder_strides[0])
+
+        self._head_indices = list(head_indices)
+
         self._filters = list(filters)
         self._spatial_dims = int(spatial_dims)
 
@@ -68,6 +64,21 @@ class DynUNetBackbone(AbstractBackbone):
                 "decoder_feature_channels and decoder_strides must have the same length. "
                 f"Got {len(self._decoder_feature_channels)} and {len(self._decoder_strides)}."
             )
+
+        if len(self._decoder_strides) > 1:
+            stride_products = []
+            for s in self._decoder_strides:
+                prod = 1
+                for v in s:
+                    prod *= int(v)
+                stride_products.append(prod)
+
+            if stride_products != sorted(stride_products):
+                raise ValueError(
+                    "decoder_strides must be provided in shallow -> deep order "
+                    "(smallest stride to largest stride). "
+                    f"Got: {self._decoder_strides}"
+                )
 
         self.model = DynUNet(
             spatial_dims=spatial_dims,
@@ -109,10 +120,16 @@ class DynUNetBackbone(AbstractBackbone):
 
     @property
     def decoder_feature_channels(self) -> Sequence[int]:
+        """
+        Channels of raw decoder outputs in shallow -> deep order.
+        """
         return self._decoder_feature_channels
 
     @property
     def decoder_strides(self) -> Sequence[Sequence[int]]:
+        """
+        Strides of raw decoder outputs in shallow -> deep order.
+        """
         return self._decoder_strides
 
     @property
@@ -120,12 +137,8 @@ class DynUNetBackbone(AbstractBackbone):
         return self._semantic_stride
 
     @property
-    def head_start(self) -> int:
-        return self._head_start
-
-    @property
-    def head_end(self) -> int:
-        return self._head_end
+    def head_indices(self) -> Sequence[int]:
+        return self._head_indices
 
     @property
     def filters(self):
@@ -153,17 +166,16 @@ class DynUNetBackbone(AbstractBackbone):
 
     def _forward_decoder(self, skips: List[Tensor], bottleneck: Tensor) -> List[Tensor]:
         """
-        Returns decoder outputs in deep -> shallow order.
+        Returns decoder outputs in shallow -> deep order.
         """
         x = bottleneck
-        decoder_outputs: List[Tensor] = []
+        decoder_outputs_deep_to_shallow: List[Tensor] = []
 
-        # DynUNet upsamples from deepest to shallowest skip
         for up, skip in zip(self.model.upsamples, reversed(skips)):
             x = up(x, skip)
-            decoder_outputs.append(x)
+            decoder_outputs_deep_to_shallow.append(x)
 
-        return decoder_outputs
+        return decoder_outputs_deep_to_shallow[::-1]
 
     # ------------------------------------------------------------------
     # Required API
@@ -173,8 +185,13 @@ class DynUNetBackbone(AbstractBackbone):
         skips, bottleneck = self._forward_encoder(x)
         decoder_outputs = self._forward_decoder(skips, bottleneck)
 
-        # final high-res feature map before semantic logits
-        semantic_output = decoder_outputs[-1]
+        if len(decoder_outputs) != len(self._decoder_strides):
+            raise RuntimeError(
+                f"Number of decoder outputs ({len(decoder_outputs)}) does not match "
+                f"number of decoder strides ({len(self._decoder_strides)})."
+            )
+
+        semantic_output = decoder_outputs[0]
         return semantic_output, decoder_outputs
 
     def forward_logits(self, semantic_output: Tensor) -> Tensor:
