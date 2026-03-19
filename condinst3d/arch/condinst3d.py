@@ -28,14 +28,22 @@ from condinst3d.utils.detection import (ImageInstancesData, InstanceList, get_on
                                         onehot_to_instance_mask)
 from condinst3d.io.transforms.remove_small_bbox import RemoveSmallBBox
 from condinst3d.visualization.utils import get_stats
-from condinst3d.utils.bached_ag import merge_prediction, batched_nms, merge_semantic_logits
+from condinst3d.utils.bached_ag import merge_patch_prediction, batched_nms, merge_semantic_logits
 from condinst3d.evaluator.iou import mask_intersection_over_union, box_intersection_over_union
 from condinst3d.evaluator.metrics.cfm_based import compute_recall, compute_fi, compute_precision
 from condinst3d.utils.mask import build_gt_cluster_ids, connected_components
-from condinst3d.evaluator.metrics import AveragePrecision, GlobalConfluentInstanceRecall, DetectionConfusionMatrix
+from condinst3d.evaluator.metrics import (AveragePrecision, GlobalConfluentInstanceRecall, DetectionConfusionMatrix,
+                                          SemanticDice)
 from condinst3d.visualization.list_instance_boxseg_visualizer import ListInstanceBoxSegSliceVisualizer
 from condinst3d.utils.lr import instantiate_scheduler
 
+
+def _squeeze_onehot_channel(x: Tensor) -> Tensor:
+    if x.ndim == 5 and x.shape[1] == 1:
+        return x[:, 0]
+    if x.ndim == 4:
+        return x
+    raise ValueError(f"Unexpected onehot mask shape: {tuple(x.shape)}")
 
 class CondInst3d(pl.LightningModule):
     """
@@ -48,7 +56,7 @@ class CondInst3d(pl.LightningModule):
         Instance separation can later be obtained with connected components.
 
     instance:
-        Train semantic + detection/controller + dynamic mask heads for
+        Train detection/controller + dynamic mask heads for
         CondInst-style instance separation.
     """
 
@@ -118,6 +126,7 @@ class CondInst3d(pl.LightningModule):
             kernel_size=cfg.heads.instance_segmentation.kernel_size,
             size_of_interest=cfg.heads.instance_segmentation.size_of_interest,
             stride=self.backbone.mask_stride,
+            max_batch_size=cfg.heads.instance_segmentation.max_batch_size,
         )
 
         self.controller_head = ControllerHead(
@@ -157,11 +166,10 @@ class CondInst3d(pl.LightningModule):
 
     def _generate_metrics(self, eval_cfg: Dict):
         metrics = torchmetrics.MetricCollection({
-            "mask_cfm": DetectionConfusionMatrix(iou_thresholds=eval_cfg.iou_list),
-            "mask_ap": AveragePrecision(iou_thresholds=eval_cfg.iou_list, interpolation=eval_cfg.ap_n_interp),
-            "box_cfm": DetectionConfusionMatrix(iou_thresholds=eval_cfg.iou_list),
-            "box_ap": AveragePrecision(iou_thresholds=eval_cfg.iou_list, interpolation=eval_cfg.ap_n_interp),
-            "mask_gcir": GlobalConfluentInstanceRecall(iou_thresholds=0.1),
+            "cfm": DetectionConfusionMatrix(iou_thresholds=eval_cfg.iou_list),
+            "ap": AveragePrecision(iou_thresholds=eval_cfg.iou_list, interpolation=eval_cfg.ap_n_interp),
+            "gcir": GlobalConfluentInstanceRecall(iou_thresholds=0.1),
+            "semantic_dice": SemanticDice(),
         })
         return metrics
 
@@ -356,7 +364,7 @@ class CondInst3d(pl.LightningModule):
 
         if split == "train":
             every_n_epochs = 5
-            if self.current_epoch % every_n_epochs != 0:
+            if self.current_epoch == 0 or self.current_epoch % every_n_epochs != 0:
                 return False
 
         return batch_idx in self.images_to_visualize.get(split, [])
@@ -394,8 +402,8 @@ class CondInst3d(pl.LightningModule):
 
             img_to_show = torch.cat([x_i, semantic_gt], dim=0)
 
-            pred_onehot = det["onehot_masks"].squeeze(1)
-            gt_onehot = tgt["onehot"].squeeze(1)
+            pred_onehot = _squeeze_onehot_channel(det["onehot_masks"])
+            gt_onehot = _squeeze_onehot_channel(tgt["onehot"])
 
             y_pred = onehot_to_instance_mask(pred_onehot)
             y_true = onehot_to_instance_mask(gt_onehot)
@@ -513,9 +521,12 @@ class CondInst3d(pl.LightningModule):
                     ap_i = ap_i.mean()
                 self._log_scalar(f"{prefix}/AP@{th_str}", ap_i)
 
-    def on_fit_start(self) -> None:
+    def on_train_start(self) -> None:
         self._assign_images_to_visualize("train", seed=42)
-        self._assign_images_to_visualize("val", seed=42)
+
+    def on_validation_start(self) -> None:
+        if not self.images_to_visualize["val"]:
+            self._assign_images_to_visualize("val", seed=42)
 
     def _forward_chunk(
             self,
@@ -804,8 +815,8 @@ class CondInst3d(pl.LightningModule):
         loss_per_entry = self.losses["classification"](cls_logits, gt_onehot)
         loss_per_anchor = loss_per_entry.sum(dim=-1)  # [B, A]
 
-        hard_neg_ratio = int(self.cfg.losses.classification.get("hard_negative_ratio", 3))
-        hard_neg_min = int(self.cfg.losses.classification.get("hard_negative_min", 32))
+        hard_neg_ratio = int(self.cfg.losses.classification_mining.get("hard_negative_ratio", 3))
+        hard_neg_min = int(self.cfg.losses.classification_mining.get("hard_negative_min", 32))
 
         selected_neg_mask = self._select_hard_negative_mask(
             loss_per_anchor=loss_per_anchor,
@@ -1110,8 +1121,12 @@ class CondInst3d(pl.LightningModule):
         outputs = self.forward(inputs)
         detections, per_image_instances = self._compute_instance_detections(outputs)
         decoded = self._decode_instance_segmentations(outputs, detections, per_image_instances)
+
+        for det in decoded:
+            det["onehot_prob"] = torch.sigmoid(det.pop("onehot_logits"))
+
         decoded = self.postprocess(decoded)
-        decoded = self.make_instance_mask(decoded)
+        decoded = self.create_instance_mask(decoded)
         return decoded
 
     @torch.no_grad()
@@ -1155,25 +1170,23 @@ class CondInst3d(pl.LightningModule):
 
         merged = self.merge_prediction(per_image, output_shape=output_shape)
         merged = self.postprocess(merged)
-        merged = self.make_instance_mask(merged)
+        merged = self.create_instance_mask(merged)
         return merged
 
     @torch.no_grad()
-    def _semantic_logits_to_instances(
+    def _semantic_logits_to_candidates(
             self,
             semantic_logits: Tensor,
     ) -> Dict[str, Tensor]:
         """
-        Convert one semantic logit map into instance predictions using connected components.
+        Convert one semantic logit map into raw instance candidates using connected components.
 
-        semantic_logits:
-            [1, H, W, D] or [H, W, D]
-
-        Returns
-        -------
-        dict with:
-            anchor_centers, anchor_strides, classes, scores,
-            onehot_masks, instance_mask, bboxes
+        Returns a dict compatible with postprocess(), with:
+          - onehot_prob: [K, H, W, D]
+          - scores: [K]
+          - anchor_centers: [K, 3]
+          - anchor_strides: [K, 3]
+          - classes: [K]
         """
         if semantic_logits.ndim == 4:
             if semantic_logits.shape[0] != 1:
@@ -1187,105 +1200,62 @@ class CondInst3d(pl.LightningModule):
         mask_thresh = float(self.inference_hyperparams.get("mask_thresh", 0.5))
         binary = prob >= mask_thresh
 
-        if not binary.any():
-            empty_mask = torch.zeros_like(binary, dtype=torch.bool).unsqueeze(0)[:0]
-            empty_long = torch.empty((0,), device=device, dtype=torch.long)
-            empty_float = torch.empty((0,), device=device, dtype=prob.dtype)
-            empty_vec3 = torch.empty((0, 3), device=device, dtype=prob.dtype)
-            empty_boxes = torch.empty((0, 6), device=device, dtype=prob.dtype)
+        empty_long = torch.empty((0,), device=device, dtype=torch.long)
+        empty_float = torch.empty((0,), device=device, dtype=prob.dtype)
+        empty_vec3 = torch.empty((0, 3), device=device, dtype=prob.dtype)
+        empty_prob = torch.empty((0, *prob.shape), device=device, dtype=prob.dtype)
 
+        if not binary.any():
             return {
                 "anchor_centers": empty_vec3,
                 "anchor_strides": empty_vec3,
                 "classes": empty_long,
                 "scores": empty_float,
-                "onehot_masks": empty_mask,
-                "instance_mask": torch.zeros_like(binary, dtype=torch.long),
-                "bboxes": empty_boxes,
+                "onehot_prob": empty_prob,
             }
 
-        cc = connected_components(binary)  # assumed to return [H, W, D] long, background=0
+        cc = connected_components(binary)
         instance_ids = torch.unique(cc)
         instance_ids = instance_ids[instance_ids > 0]
 
-        onehot_masks: List[Tensor] = []
-        scores: List[Tensor] = []
-        centers: List[Tensor] = []
+        onehot_probs = []
+        scores = []
+        centers = []
 
         for inst_id in instance_ids:
             inst_mask = (cc == inst_id)
             if not inst_mask.any():
                 continue
 
-            inst_prob = prob[inst_mask]
-            score = inst_prob.mean()
+            inst_prob = prob * inst_mask
+            score = prob[inst_mask].mean()
+            center = inst_mask.nonzero(as_tuple=False).float().mean(dim=0)
 
-            coords = inst_mask.nonzero(as_tuple=False).float()
-            center = coords.mean(dim=0)
-
-            onehot_masks.append(inst_mask)
+            onehot_probs.append(inst_prob)
             scores.append(score)
             centers.append(center)
 
-        if len(onehot_masks) == 0:
-            empty_mask = torch.zeros_like(binary, dtype=torch.bool).unsqueeze(0)[:0]
-            empty_long = torch.empty((0,), device=device, dtype=torch.long)
-            empty_float = torch.empty((0,), device=device, dtype=prob.dtype)
-            empty_vec3 = torch.empty((0, 3), device=device, dtype=prob.dtype)
-            empty_boxes = torch.empty((0, 6), device=device, dtype=prob.dtype)
-
+        if len(onehot_probs) == 0:
             return {
                 "anchor_centers": empty_vec3,
                 "anchor_strides": empty_vec3,
                 "classes": empty_long,
                 "scores": empty_float,
-                "onehot_masks": empty_mask,
-                "instance_mask": torch.zeros_like(binary, dtype=torch.long),
-                "bboxes": empty_boxes,
+                "onehot_prob": empty_prob,
             }
 
-        onehot_masks_t = torch.stack(onehot_masks, dim=0)
-        scores_t = torch.stack(scores, dim=0)
+        onehot_prob_t = torch.stack(onehot_probs, dim=0)  # [K,H,W,D]
+        scores_t = torch.stack(scores, dim=0)  # [K]
         centers_t = torch.stack(centers, dim=0).to(dtype=prob.dtype)
         strides_t = torch.ones_like(centers_t)
-        classes_t = torch.zeros((len(onehot_masks),), device=device, dtype=torch.long)
-
-        instance_mask = priority_based_onehot_to_instance_mask(
-            onehot_mask=onehot_masks_t,
-            scores=scores_t,
-        )
-
-        remained_onehot, remained_ids = instance_mask_to_onehot(
-            instance_mask,
-            return_instance_ids=True,
-        )
-
-        if remained_onehot.ndim == 5 and remained_onehot.shape[1] == 1:
-            remained_onehot = remained_onehot[:, 0]
-        if remained_onehot.ndim == 3:
-            remained_onehot = remained_onehot.unsqueeze(0)
-
-        if len(remained_onehot) != len(onehot_masks_t):
-            keep = torch.isin(
-                torch.arange(1, len(onehot_masks_t) + 1, device=remained_ids.device),
-                remained_ids,
-            )
-            centers_t = centers_t[keep]
-            strides_t = strides_t[keep]
-            classes_t = classes_t[keep]
-            scores_t = scores_t[keep]
-            onehot_masks_t = onehot_masks_t[keep]
-
-        bboxes = get_onehot_instance_mask_boxes(remained_onehot.unsqueeze(1))
+        classes_t = torch.zeros((len(onehot_probs),), device=device, dtype=torch.long)
 
         return {
             "anchor_centers": centers_t,
             "anchor_strides": strides_t,
             "classes": classes_t,
             "scores": scores_t,
-            "onehot_masks": remained_onehot,
-            "instance_mask": instance_mask,
-            "bboxes": bboxes,
+            "onehot_prob": onehot_prob_t,
         }
 
     @torch.no_grad()
@@ -1298,20 +1268,17 @@ class CondInst3d(pl.LightningModule):
         inputs: [B, C, H, W, D]
         """
         outputs = self.forward(inputs)
-        semantic_logits = outputs["semantic_logits"]  # [B, 1, H, W, D] expected
+        semantic_logits = outputs["semantic_logits"]
 
         stride = self.backbone.semantic_stride
-        if isinstance(stride, int):
-            needs_upsample = stride > 1
-        else:
-            needs_upsample = any(int(s) > 1 for s in stride)
-
-        if needs_upsample:
-            semantic_logits = aligned_trilinear(semantic_logits, stride)
+        semantic_logits = self._maybe_upsample_logits(semantic_logits, stride)
 
         preds = []
         for i in range(semantic_logits.shape[0]):
-            preds.append(self._semantic_logits_to_instances(semantic_logits[i]))
+            preds.append(self._semantic_logits_to_candidates(semantic_logits[i]))
+
+        preds = self.postprocess(preds)
+        preds = self.create_instance_mask(preds)
         return preds
 
     @torch.no_grad()
@@ -1330,37 +1297,34 @@ class CondInst3d(pl.LightningModule):
         outputs = self.forward(flat_inputs)
 
         semantic_logits = outputs["semantic_logits"]
-
-        stride = self.backbone.semantic_stride
-        if isinstance(stride, int):
-            needs_upsample = stride > 1
-        else:
-            needs_upsample = any(int(s) > 1 for s in stride)
-
-        if needs_upsample:
-            semantic_logits = aligned_trilinear(semantic_logits, stride)
+        semantic_logits = self._maybe_upsample_logits(
+            semantic_logits,
+            self.backbone.semantic_stride,
+        )
 
         offsets = outputs.get("offsets", None)
         if offsets is None:
             raise RuntimeError("Patch inference requires offsets in outputs['offsets'].")
 
-        per_image_logits: List[List[Tensor]] = [[] for _ in range(B)]
-        per_image_offsets: List[List[Tensor]] = [[] for _ in range(B)]
+        per_image_logits = [[] for _ in range(B)]
+        per_image_offsets = [[] for _ in range(B)]
 
         for flat_i in range(B * P):
             b = flat_i // P
             per_image_logits[b].append(semantic_logits[flat_i])
             per_image_offsets[b].append(offsets[flat_i])
 
-        preds: List[Dict[str, Tensor]] = []
+        preds = []
         for b in range(B):
             merged_logits = merge_semantic_logits(
                 patch_logits=per_image_logits[b],
                 patch_offsets=per_image_offsets[b],
                 output_shape=output_shape,
             )
-            preds.append(self._semantic_logits_to_instances(merged_logits))
+            preds.append(self._semantic_logits_to_candidates(merged_logits))
 
+        preds = self.postprocess(preds)
+        preds = self.create_instance_mask(preds)
         return preds
 
     @torch.no_grad()
@@ -1370,7 +1334,8 @@ class CondInst3d(pl.LightningModule):
             output_shape: Tuple[int, int, int],
     ) -> List[Dict[str, Tensor]]:
         mask_thresh = float(self.inference_hyperparams.get("mask_thresh", 0.5))
-        nms_thresh = float(self.inference_hyperparams.get("nms_thresh", 0.5))
+        nms_thresh = float(self.inference_hyperparams.get("nms_thresh", 0.75))
+        group_thresh = float(self.inference_hyperparams.get("group_thresh", 0.35))
 
         aggregated = []
         for per_img_det in det_and_seg:
@@ -1412,69 +1377,92 @@ class CondInst3d(pl.LightningModule):
                 merged_img["offsets"].append(offsets_p)
 
             for key in merged_img:
-                if len(merged_img[key]) == 0:
-                    raise RuntimeError(f"Expected non-empty list for key={key} during merge_prediction.")
                 merged_img[key] = torch.cat(merged_img[key], dim=0)
 
             aggregated.append(merged_img)
 
         return [
-            merge_prediction(
+            merge_patch_prediction(
                 per_img,
                 output_shape=output_shape,
                 mask_thresh=mask_thresh,
+                group_iom_thresh=group_thresh,
             )
             for per_img in aggregated
         ]
 
     @torch.no_grad()
     def postprocess(self, det_and_seg: List[Dict[str, Tensor]]) -> List[Dict[str, Tensor]]:
+        """
+        Unified postprocessing for both semantic and instance branches.
+
+        Expected per-image keys:
+          - anchor_centers: [K,3]
+          - anchor_strides: [K,3]
+          - classes: [K]
+          - scores: [K]
+          - onehot_prob: [K,H,W,D]/[K,1,H,W,D]
+
+        Returns per-image dict with:
+          - anchor_centers
+          - anchor_strides
+          - classes
+          - scores
+          - onehot_masks
+        """
         mask_thresh = float(self.inference_hyperparams.get("mask_thresh", 0.5))
-        nms_thresh = float(self.inference_hyperparams.get("nms_thresh", 0.5))
+        nms_thresh = float(self.inference_hyperparams.get("nms_thresh", 0.75))
 
         output = []
-        for per_img_det_and_seg in det_and_seg:
-            anchor_centers = per_img_det_and_seg["anchor_centers"]
-            anchor_strides = per_img_det_and_seg["anchor_strides"]
-            classes = per_img_det_and_seg["classes"]
-            scores = per_img_det_and_seg["scores"]
-            onehot_probs = per_img_det_and_seg["onehot_prob"]
-            onehot_masks = onehot_probs >= mask_thresh
+        for per_img in det_and_seg:
+            anchor_centers = per_img["anchor_centers"]
+            anchor_strides = per_img["anchor_strides"]
+            classes = per_img["classes"]
+            scores = per_img["scores"]
+            onehot_prob = _squeeze_onehot_channel(per_img["onehot_prob"])
 
-            # post-processing
-            if scores.numel() > 0:
-                K = onehot_masks.shape[0]
-                if K > 0:
-                    onehot_masks_pp = []
-                    for inst in range(K):
-                        onehot_masks_pp.append(self.postproc_transform(onehot_masks[inst]))
+            onehot_masks = onehot_prob >= mask_thresh
 
-                    onehot_masks_pp = torch.stack(onehot_masks_pp)
-                else:
-                    onehot_masks_pp = onehot_masks
+            if onehot_masks.numel() == 0:
+                output.append({
+                    "anchor_centers": anchor_centers,
+                    "anchor_strides": anchor_strides,
+                    "classes": classes,
+                    "scores": scores,
+                    "onehot_masks": onehot_masks,
+                })
+                continue
 
-                # 2) remove empty instances
-                keep_pp = onehot_masks_pp.flatten(1).any(dim=1)
+            K = onehot_masks.shape[0]
 
-                anchor_centers = anchor_centers[keep_pp]
-                anchor_strides = anchor_strides[keep_pp]
-                classes = classes[keep_pp]
-                scores = scores[keep_pp]
-                onehot_masks = onehot_masks_pp[keep_pp]
+            if K > 0:
+                onehot_masks_pp = []
+                for k in range(K):
+                    onehot_masks_pp.append(self.postproc_transform(onehot_masks[k].unsqueeze(0))[0])
+                onehot_masks_pp = torch.stack(onehot_masks_pp, dim=0)
+            else:
+                onehot_masks_pp = onehot_masks
 
-                if scores.numel() > 1:
-                    bboxes = get_onehot_instance_mask_boxes(onehot_masks)
-                    bboxes = bboxes.float()
-                    # adding offset in z-direction
-                    bboxes[:, 2] -= 0.5
-                    bboxes[:, 5] += 0.5
-                    keep_nms = batched_nms(bboxes, scores, threshold=nms_thresh, metric="iom")
+            keep_nonempty = onehot_masks_pp.flatten(1).any(dim=1)
 
-                    anchor_centers = anchor_centers[keep_nms]
-                    anchor_strides = anchor_strides[keep_nms]
-                    classes = classes[keep_nms]
-                    scores = scores[keep_nms]
-                    onehot_masks = onehot_masks[keep_nms]
+            anchor_centers = anchor_centers[keep_nonempty]
+            anchor_strides = anchor_strides[keep_nonempty]
+            classes = classes[keep_nonempty]
+            scores = scores[keep_nonempty]
+            onehot_masks = onehot_masks_pp[keep_nonempty]
+
+            if scores.numel() > 1:
+                bboxes = get_onehot_instance_mask_boxes(onehot_masks.unsqueeze(1)).float()
+                bboxes[:, 2] -= 0.5
+                bboxes[:, 5] += 0.5
+
+                keep_nms = batched_nms(bboxes, scores, threshold=nms_thresh, metric="iom")
+
+                anchor_centers = anchor_centers[keep_nms]
+                anchor_strides = anchor_strides[keep_nms]
+                classes = classes[keep_nms]
+                scores = scores[keep_nms]
+                onehot_masks = onehot_masks[keep_nms]
 
             output.append({
                 "anchor_centers": anchor_centers,
@@ -1487,23 +1475,72 @@ class CondInst3d(pl.LightningModule):
         return output
 
     @torch.no_grad()
-    def make_instance_mask(self, det_and_seg: List[Dict[str, Tensor]]) -> List[Dict[str, Tensor]]:
-        outputs = []
-        for per_img_det_and_seg in det_and_seg:
-            onehot = per_img_det_and_seg['onehot_masks']
-            scores = per_img_det_and_seg['scores']
-            instance_mask = priority_based_onehot_to_instance_mask(onehot_mask=onehot, scores=scores)
+    def create_instance_mask(self, det_and_seg: List[Dict[str, Tensor]]) -> List[Dict[str, Tensor]]:
+        """
+        Create final instance masks from postprocessed onehot masks and filter
+        metadata to only the instances that remain after priority-based overlap
+        resolution.
 
-            remained_onehot, remained_ids = instance_mask_to_onehot(instance_mask, return_instance_ids=True)
+        Expected per-image keys:
+          - anchor_centers
+          - anchor_strides
+          - classes
+          - scores
+          - onehot_masks
+        """
+        outputs = []
+
+        for per_img in det_and_seg:
+            onehot = per_img["onehot_masks"]
+            scores = per_img["scores"]
+
+            if onehot.numel() == 0:
+                spatial_shape = onehot.shape[1:]
+                if len(spatial_shape) != 3:
+                    raise ValueError("Empty onehot_masks must have shape [0, H, W, D].")
+                instance_mask = torch.zeros(
+                    spatial_shape,
+                    device=onehot.device,
+                    dtype=torch.long,
+                )
+                bboxes = torch.empty((0, 6), device=onehot.device, dtype=torch.float32)
+
+                out = dict(per_img)
+                out["instance_mask"] = instance_mask
+                out["bboxes"] = bboxes
+                outputs.append(out)
+                continue
+
+            instance_mask = priority_based_onehot_to_instance_mask(
+                onehot_mask=onehot,
+                scores=scores,
+            )
+
+            remained_onehot, remained_ids = instance_mask_to_onehot(
+                instance_mask,
+                return_instance_ids=True,
+            )
+
+            if remained_onehot.ndim == 5 and remained_onehot.shape[1] == 1:
+                remained_onehot = remained_onehot[:, 0]
+            if remained_onehot.ndim == 3:
+                remained_onehot = remained_onehot.unsqueeze(0)
+
+            out = dict(per_img)
+
             if len(remained_onehot) != len(onehot):
-                priority_keep = torch.isin(torch.arange(1, len(onehot) + 1, device=remained_ids.device),
-                                           remained_ids)
-                for key in per_img_det_and_seg.keys():
-                    per_img_det_and_seg[key] = per_img_det_and_seg[key][priority_keep]
-            per_img_det_and_seg["instance_mask"] = instance_mask
-            bboxes = get_onehot_instance_mask_boxes(remained_onehot.unsqueeze(1))
-            per_img_det_and_seg["bboxes"] = bboxes
-            outputs.append(per_img_det_and_seg)
+                priority_keep = torch.isin(
+                    torch.arange(1, len(onehot) + 1, device=remained_ids.device),
+                    remained_ids,
+                )
+                for key in ["anchor_centers", "anchor_strides", "classes", "scores"]:
+                    out[key] = out[key][priority_keep]
+
+            out["onehot_masks"] = remained_onehot
+            out["instance_mask"] = instance_mask
+            out["bboxes"] = get_onehot_instance_mask_boxes(remained_onehot.unsqueeze(1))
+            outputs.append(out)
+
         return outputs
 
     @torch.no_grad()
@@ -1546,14 +1583,35 @@ class CondInst3d(pl.LightningModule):
             scores = det["scores"]  # [K]
 
             # --- masks ---
-            pred_onehot = det["onehot_masks"].squeeze(1)  # [K,H,W,D]
-            gt_onehot = tgt["onehot"].squeeze(1)  # [G,H,W,D]
+            pred_onehot = _squeeze_onehot_channel(det["onehot_masks"])  # [K,H,W,D]
+            gt_onehot = _squeeze_onehot_channel(tgt["onehot"])  # [G,H,W,D]
+
+            # --- semantic dice ---
+            if pred_onehot.shape[0] == 0:
+                semantic_pred = torch.zeros(
+                    gt_onehot.shape[1:],
+                    device=gt_onehot.device,
+                    dtype=torch.bool,
+                )
+            else:
+                semantic_pred = pred_onehot.any(dim=0)
+
+            if gt_onehot.shape[0] == 0:
+                semantic_gt = torch.zeros(
+                    pred_onehot.shape[1:],
+                    device=pred_onehot.device,
+                    dtype=torch.bool,
+                )
+            else:
+                semantic_gt = gt_onehot.any(dim=0)
+
+            metric_dict["semantic_dice"].update(semantic_pred, semantic_gt)
 
             pairwise_mask_iou = mask_intersection_over_union(
                 pred_onehot, gt_onehot, max_chunk_size=32
             )
-            metric_dict["mask_cfm"].update(pairwise_mask_iou, scores)
-            metric_dict["mask_ap"].update(pairwise_mask_iou, scores)
+            metric_dict["cfm"].update(pairwise_mask_iou, scores)
+            metric_dict["ap"].update(pairwise_mask_iou, scores)
 
             gt_cluster_ids = build_gt_cluster_ids(
                 semantic_mask=tgt["semantic_mask"][0],
@@ -1561,23 +1619,13 @@ class CondInst3d(pl.LightningModule):
                 connectivity=26,
                 min_instances_in_cluster=2,
             )
-            metric_dict["mask_gcir"].update(pairwise_mask_iou, scores, gt_cluster_ids)
-
-            # --- boxes ---
-            pred_boxes = det["bboxes"]
-            gt_boxes = tgt["boxes"]
-
-            pairwise_box_iou = box_intersection_over_union(pred_boxes, gt_boxes)  # [K,G]
-            metric_dict["box_cfm"].update(pairwise_box_iou, scores)
-            metric_dict["box_ap"].update(pairwise_box_iou, scores)
+            metric_dict["gcir"].update(pairwise_mask_iou, scores, gt_cluster_ids)
 
         # -------- visualization gate --------
         if self._should_visualize_split("val", batch_idx):
-            # Prefer full-volume input for plotting (no patch stitching)
             inputs = batch.get("inputs_orig", batch.get("inputs", None))
             cases = batch.get("case", None)
 
-            # If inputs_full is missing, skip gracefully (still return preds)
             if inputs is not None:
                 self._visualize_batch(
                     inputs=inputs,
@@ -1592,41 +1640,28 @@ class CondInst3d(pl.LightningModule):
     def on_validation_epoch_end(self) -> None:
         metric_dict = self.metrics["validation"]
 
-        mask_cfm = metric_dict["mask_cfm"].compute()
-        mask_ap = metric_dict["mask_ap"].compute()
-        mask_gcir = metric_dict["mask_gcir"].compute()
+        mask_cfm = metric_dict["cfm"].compute()
+        mask_ap = metric_dict["ap"].compute()
+        mask_gcir = metric_dict["gcir"].compute()
+        semantic_dice = metric_dict["semantic_dice"].compute()
 
-        box_cfm = metric_dict["box_cfm"].compute()
-        box_ap = metric_dict["box_ap"].compute()
-
-        self._log_scalar("Validation/Masks/mAP", mask_ap.mean())
-        self._log_scalar("Validation/Masks/GCIR", mask_gcir)
-        self._log_scalar("Validation/Boxes/mAP", box_ap.mean())
+        self._log_scalar("Validation/mAP", mask_ap.mean())
+        self._log_scalar("Validation/GCIR", mask_gcir)
+        self._log_scalar("Validation/Semantic-Dice", semantic_dice)
 
         self._log_cfm_series(
-            prefix="Validation/Masks-IoU",
+            prefix="Validation-Masks-IoU",
             cfm=mask_cfm,
-            iou_thresholds=metric_dict["mask_cfm"].iou_thresholds,
+            iou_thresholds=metric_dict["cfm"].iou_thresholds,
             ap_per_thr=mask_ap if isinstance(mask_ap, Tensor) and mask_ap.numel() > 0 else None,
         )
 
-        self._log_cfm_series(
-            prefix="Validation/Boxes-IoU",
-            cfm=box_cfm,
-            iou_thresholds=metric_dict["box_cfm"].iou_thresholds,
-            ap_per_thr=box_ap if isinstance(box_ap, Tensor) and box_ap.numel() > 0 else None,
-        )
 
         if self.trainer is not None and self.trainer.is_global_zero:
-            mask_plot_fn = getattr(metric_dict["mask_ap"], "plot", None)
+            mask_plot_fn = getattr(metric_dict["ap"], "plot", None)
             if callable(mask_plot_fn):
                 mask_fig, _ = mask_plot_fn()
-                self._log_figure("Validation/Masks/PR-curve", mask_fig, close=True)
-
-            box_plot_fn = getattr(metric_dict["box_ap"], "plot", None)
-            if callable(box_plot_fn):
-                box_fig, _ = box_plot_fn()
-                self._log_figure("Validation/Boxes/PR-curve", box_fig, close=True)
+                self._log_figure("Validation/PR-curve", mask_fig, close=True)
 
         metric_dict.reset()
 
