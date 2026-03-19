@@ -99,22 +99,13 @@ def setup_logger(cfg: DictConfig) -> TensorBoardLogger:
         if iou_list:
             layout = {
                 "Validation-Masks": {
-                    "TP": ["Multiline", [f"Validation/Masks-IoU/TP@{th:.2f}" for th in iou_list]],
-                    "FP": ["Multiline", [f"Validation/Masks-IoU/FP@{th:.2f}" for th in iou_list]],
-                    "FN": ["Multiline", [f"Validation/Masks-IoU/FN@{th:.2f}" for th in iou_list]],
-                    "Precision": ["Multiline", [f"Validation/Masks-IoU/Precision@{th:.2f}" for th in iou_list]],
-                    "Recall": ["Multiline", [f"Validation/Masks-IoU/Recall@{th:.2f}" for th in iou_list]],
-                    "F1": ["Multiline", [f"Validation/Masks-IoU/F1@{th:.2f}" for th in iou_list]],
-                    "AP": ["Multiline", [f"Validation/Masks-IoU/AP@{th:.2f}" for th in iou_list]],
-                },
-                "Validation-Boxes": {
-                    "TP": ["Multiline", [f"Validation/Boxes-IoU/TP@{th:.2f}" for th in iou_list]],
-                    "FP": ["Multiline", [f"Validation/Boxes-IoU/FP@{th:.2f}" for th in iou_list]],
-                    "FN": ["Multiline", [f"Validation/Boxes-IoU/FN@{th:.2f}" for th in iou_list]],
-                    "Precision": ["Multiline", [f"Validation/Boxes-IoU/Precision@{th:.2f}" for th in iou_list]],
-                    "Recall": ["Multiline", [f"Validation/Boxes-IoU/Recall@{th:.2f}" for th in iou_list]],
-                    "F1": ["Multiline", [f"Validation/Boxes-IoU/F1@{th:.2f}" for th in iou_list]],
-                    "AP": ["Multiline", [f"Validation/Boxes-IoU/AP@{th:.2f}" for th in iou_list]],
+                    "TP": ["Multiline", [f"Validation-Masks-IoU/TP@{th:.2f}" for th in iou_list]],
+                    "FP": ["Multiline", [f"Validation-Masks-IoU/FP@{th:.2f}" for th in iou_list]],
+                    "FN": ["Multiline", [f"Validation-Masks-IoU/FN@{th:.2f}" for th in iou_list]],
+                    "Precision": ["Multiline", [f"Validation-Masks-IoU/Precision@{th:.2f}" for th in iou_list]],
+                    "Recall": ["Multiline", [f"Validation-Masks-IoU/Recall@{th:.2f}" for th in iou_list]],
+                    "F1": ["Multiline", [f"Validation-Masks-IoU/F1@{th:.2f}" for th in iou_list]],
+                    "AP": ["Multiline", [f"Validation-Masks-IoU/AP@{th:.2f}" for th in iou_list]],
                 },
             }
             logger.experiment.add_custom_scalars(layout)
@@ -129,7 +120,7 @@ def setup_callbacks(cfg: DictConfig) -> List[Any]:
         return [instantiate(c) for c in _as_list(callbacks_cfg)]
 
     best_ckpt = ModelCheckpoint(
-        monitor=str(getattr(cfg.train, "monitor", "Validation/Masks/mAP")),
+        monitor=str(getattr(cfg.train, "monitor", "Validation/mAP")),
         mode=str(getattr(cfg.train, "monitor_mode", "max")),
         save_top_k=int(getattr(cfg.train, "save_top_k", 3)),
         filename=str(getattr(cfg.train, "ckpt_filename", "best_{epoch}-{step}")),
