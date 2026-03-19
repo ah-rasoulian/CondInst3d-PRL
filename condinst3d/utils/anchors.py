@@ -107,6 +107,7 @@ class AnisotropicATSSMatcher(Matcher):
         num_gt = boxes.shape[0]
         num_anchors = anchors.shape[0]
 
+        spacing = torch.as_tensor(spacing, dtype=torch.float32, device=boxes.device)
         distances_, _, anchors_center = boxes_center_distance(boxes, anchors, spacing=spacing)  # num_boxes x anchors
         distances = convert_to_tensor(distances_)
 
