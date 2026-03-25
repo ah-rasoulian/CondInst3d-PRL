@@ -159,8 +159,8 @@ class CondInst3d(pl.LightningModule):
     @property
     def postproc_transform(self) -> Transform:
         return Compose([
-            KeepLargestConnectedComponent(num_components=1, applied_labels=1, connectivity=3),
-            RemoveSmallObjects(min_size=16, connectivity=3),
+            KeepLargestConnectedComponent(num_components=1, applied_labels=1, connectivity=1),
+            RemoveSmallObjects(min_size=16, connectivity=1),
             RemoveSmallBBox(min_size=(5, 5, 2), threshold=0.5),
         ])
 
@@ -923,7 +923,11 @@ class CondInst3d(pl.LightningModule):
 
         # visualization
         if self._should_visualize_split("train", batch_idx):
+            inputs = inputs[0:1, ...]
+            targets = targets[0:1]
+            cases = cases[0:1]
             with torch.no_grad():
+                batch['inputs'] = inputs
                 preds = self.predict_step(batch, batch_idx)
 
             self._visualize_batch(
