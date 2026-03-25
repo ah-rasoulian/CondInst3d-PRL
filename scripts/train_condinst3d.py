@@ -157,11 +157,20 @@ def setup_strategy(cfg: DictConfig):
 def setup_trainer(cfg: DictConfig, logger, callbacks) -> Trainer:
     trainer_kwargs: Dict[str, Any] = {}
     if getattr(cfg.train, "trainer", None) is not None:
-        trainer_kwargs = OmegaConf.to_container(cfg.train.trainer, resolve=True)  # type: ignore[assignment]
+        trainer_kwargs = OmegaConf.to_container(cfg.train.trainer, resolve=True)
 
     trainer_kwargs["logger"] = logger
     trainer_kwargs["callbacks"] = callbacks
-    trainer_kwargs["strategy"] = setup_strategy(cfg)
+
+    devices = trainer_kwargs.get("devices", 1)
+    use_ddp = False
+    if isinstance(devices, int):
+        use_ddp = devices > 1
+    elif isinstance(devices, (list, tuple)):
+        use_ddp = len(devices) > 1
+
+    if use_ddp:
+        trainer_kwargs["strategy"] = setup_strategy(cfg)
 
     trainer_kwargs.setdefault("accelerator", "gpu")
     trainer_kwargs.setdefault("log_every_n_steps", 1)
@@ -169,6 +178,30 @@ def setup_trainer(cfg: DictConfig, logger, callbacks) -> Trainer:
 
     return pl.Trainer(**trainer_kwargs)
 
+def setup_eval_trainer(cfg: DictConfig, logger, callbacks, precision: str = "32-true") -> Trainer:
+    trainer_kwargs: Dict[str, Any] = {}
+    if getattr(cfg.train, "trainer", None) is not None:
+        trainer_kwargs = OmegaConf.to_container(cfg.train.trainer, resolve=True)
+
+    trainer_kwargs["logger"] = logger
+    trainer_kwargs["callbacks"] = callbacks
+    trainer_kwargs["precision"] = precision  # force full precision for eval
+
+    devices = trainer_kwargs.get("devices", 1)
+    use_ddp = False
+    if isinstance(devices, int):
+        use_ddp = devices > 1
+    elif isinstance(devices, (list, tuple)):
+        use_ddp = len(devices) > 1
+
+    if use_ddp:
+        trainer_kwargs["strategy"] = setup_strategy(cfg)
+
+    trainer_kwargs.setdefault("accelerator", "gpu")
+    trainer_kwargs.setdefault("log_every_n_steps", 1)
+    trainer_kwargs.setdefault("enable_checkpointing", False)
+
+    return pl.Trainer(**trainer_kwargs)
 
 # -------------------- runner --------------------
 class Runner:
@@ -236,23 +269,27 @@ class Runner:
         ckpt_path: Optional[str] = None,
     ) -> None:
         """
-        Run validation.
+        Run validation in full precision.
 
         Example:
             python scripts/train.py validate --config_name=condinst3d
             python scripts/train.py validate --config_name=condinst3d --ckpt_path=/path/to/best.ckpt
         """
-        cfg, model, dm, trainer, resume_ckpt_path = self._build(
+        cfg, model, dm, _, resume_ckpt_path = self._build(
             config_name=config_name,
             overrides=overrides,
             print_config=print_config,
         )
 
+        logger = setup_logger(cfg)
+        callbacks = setup_callbacks(cfg)
+        trainer = setup_eval_trainer(cfg, logger=logger, callbacks=callbacks, precision="32-true")
+
         final_ckpt_path = ckpt_path
         if final_ckpt_path is None:
             final_ckpt_path = resume_ckpt_path
 
-        trainer.validate(model=model, datamodule=dm, ckpt_path=final_ckpt_path)
+        trainer.validate(model=model, datamodule=dm, ckpt_path=final_ckpt_path, verbose=False)
 
 
 if __name__ == "__main__":
