@@ -28,7 +28,6 @@ class SwinUNETRBackbone(AbstractBackbone):
     def __init__(
         self,
         *,
-        img_size,
         in_channels: int,
         out_channels: int,
         feature_size: int,
@@ -90,7 +89,6 @@ class SwinUNETRBackbone(AbstractBackbone):
         self._semantic_stride = self._decoder_strides[0]
 
         self.model = SwinUNETR(
-            img_size=img_size,
             in_channels=in_channels,
             out_channels=out_channels,
             depths=depths,
