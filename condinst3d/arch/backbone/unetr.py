@@ -12,16 +12,15 @@ class UNETRBackbone(AbstractBackbone):
     """
     UNETR backbone adapter for CondInst-style models.
 
-    Returned decoder_outputs are ordered:
-        deep -> shallow
-
-    and include the final semantic feature map as the last element:
-        semantic_output == decoder_outputs[-1]
+    Public convention:
+      - decoder_outputs are ordered shallow -> deep
+      - decoder_outputs[0] is the highest-resolution decoder feature map
+      - decoder_outputs[-1] is the lowest-resolution decoder feature map
 
     Notes
     -----
     - semantic_output is the final feature map BEFORE semantic logits.
-    - heads are created only from decoder outputs in [head_start, head_end].
+    - head_indices are interpreted in shallow -> deep indexing space.
     - the built-in UNETR segmentation head is kept as self.model.out, but your
       CondInst model can ignore it and use its own semantic head.
     """
@@ -34,8 +33,7 @@ class UNETRBackbone(AbstractBackbone):
         img_size,
         feature_size: int,
         heads_dim: int,
-        head_start: int,
-        head_end: int = -1,
+        head_indices: Sequence[int],
         hidden_size: int = 768,
         mlp_dim: int = 3072,
         num_heads: int = 12,
@@ -55,36 +53,37 @@ class UNETRBackbone(AbstractBackbone):
             raise ValueError(f"This wrapper currently expects spatial_dims=3, got {spatial_dims}.")
 
         self._in_channels = int(in_channels)
-        self._out_channels = int(feature_size)  # semantic feature channels before logits
+        self._out_channels = int(feature_size)  # channels of semantic_output before logits
         self._heads_dim = int(heads_dim)
-        self._head_start = int(head_start)
-        self._head_end = int(head_end)
+        self._head_indices = list(head_indices)
         self._feature_size = int(feature_size)
         self._hidden_size = int(hidden_size)
         self._spatial_dims = int(spatial_dims)
 
-        # MONAI UNETR decoder channels from deep -> shallow:
-        # dec3 = feature_size * 8
-        # dec2 = feature_size * 4
-        # dec1 = feature_size * 2
-        # out  = feature_size
+        # Native UNETR decoder traversal is deep -> shallow:
+        #   dec3 = feature_size * 8
+        #   dec2 = feature_size * 4
+        #   dec1 = feature_size * 2
+        #   out  = feature_size
+        #
+        # Public contract is shallow -> deep, so reverse it:
         self._decoder_feature_channels = [
-            feature_size * 8,
-            feature_size * 4,
-            feature_size * 2,
             feature_size,
+            feature_size * 2,
+            feature_size * 4,
+            feature_size * 8,
         ]
 
         # UNETR uses patch size 16, and decoder upsamples by 2 each stage.
-        # Therefore decoder strides are naturally:
-        # 8, 4, 2, 1 (deep -> shallow), same on each axis.
+        # Native decoder strides are deep -> shallow: 8, 4, 2, 1
+        # Public contract is shallow -> deep: 1, 2, 4, 8
         self._decoder_strides = [
-            (8, 8, 8),
-            (4, 4, 4),
-            (2, 2, 2),
             (1, 1, 1),
+            (2, 2, 2),
+            (4, 4, 4),
+            (8, 8, 8),
         ]
-        self._semantic_stride = (1, 1, 1)
+        self._semantic_stride = self._decoder_strides[0]
 
         self.model = UNETR(
             in_channels=in_channels,
@@ -127,10 +126,16 @@ class UNETRBackbone(AbstractBackbone):
 
     @property
     def decoder_feature_channels(self) -> Sequence[int]:
+        """
+        Channels of raw decoder outputs in shallow -> deep order.
+        """
         return self._decoder_feature_channels
 
     @property
     def decoder_strides(self) -> Sequence[Sequence[int]]:
+        """
+        Strides of raw decoder outputs in shallow -> deep order.
+        """
         return self._decoder_strides
 
     @property
@@ -138,12 +143,8 @@ class UNETRBackbone(AbstractBackbone):
         return self._semantic_stride
 
     @property
-    def head_start(self) -> int:
-        return self._head_start
-
-    @property
-    def head_end(self) -> int:
-        return self._head_end
+    def head_indices(self) -> Sequence[int]:
+        return self._head_indices
 
     @property
     def filters(self):
@@ -164,10 +165,10 @@ class UNETRBackbone(AbstractBackbone):
 
     def forward_features(self, x: Tensor) -> tuple[Tensor, list[Tensor]]:
         # MONAI UNETR forward pattern:
-        # x, hidden_states_out = vit(x)
+        # x_vit, hidden_states_out = vit(x)
         # enc1 from input
         # enc2, enc3, enc4 from hidden_states_out[3], [6], [9]
-        # dec4 = proj_feat(x)
+        # dec4 = proj_feat(x_vit)
         # dec3 = decoder5(dec4, enc4)
         # dec2 = decoder4(dec3, enc3)
         # dec1 = decoder3(dec2, enc2)
@@ -191,8 +192,16 @@ class UNETRBackbone(AbstractBackbone):
         dec1 = self.model.decoder3(dec2, enc2)
         out = self.model.decoder2(dec1, enc1)
 
-        decoder_outputs = [dec3, dec2, dec1, out]
-        semantic_output = out
+        # Public contract: shallow -> deep
+        decoder_outputs = [out, dec1, dec2, dec3]
+
+        if len(decoder_outputs) != len(self.decoder_feature_channels):
+            raise RuntimeError(
+                f"Expected {len(self.decoder_feature_channels)} decoder outputs, "
+                f"got {len(decoder_outputs)}."
+            )
+
+        semantic_output = decoder_outputs[0]
         return semantic_output, decoder_outputs
 
     def forward_logits(self, semantic_output: Tensor) -> Tensor:

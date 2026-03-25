@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import List, Sequence
 
-import torch.nn as nn
 from torch import Tensor
 from monai.networks.nets import SegResNet
 
@@ -13,16 +12,16 @@ class SegResNetBackbone(AbstractBackbone):
     """
     SegResNet backbone adapter for CondInst-style models.
 
-    Returned decoder_outputs are ordered:
-        deep -> shallow
-    and include the final semantic feature map as the last element:
-        semantic_output == decoder_outputs[-1]
+    Public convention:
+      - decoder_outputs are ordered shallow -> deep
+      - decoder_outputs[0] is the highest-resolution decoder feature map
+      - decoder_outputs[-1] is the lowest-resolution decoder feature map
 
     Notes
     -----
-    - semantic_output is the final feature map BEFORE semantic logits.
-    - heads are created only from decoder outputs in [head_start, head_end].
-    - This wrapper keeps the semantic head outside the backbone, matching your setup.
+    - semantic_output is the final shallow decoder feature BEFORE semantic logits.
+    - head_indices are interpreted in shallow -> deep indexing space.
+    - semantic logits are produced by MONAI's conv_final when use_conv_final=True.
     """
 
     def __init__(
@@ -32,15 +31,15 @@ class SegResNetBackbone(AbstractBackbone):
         in_channels: int,
         init_filters: int,
         heads_dim: int,
-        head_start: int,
-        head_end: int = -1,
+        head_indices: Sequence[int],
+        semantic_out_channels: int = 1,
         blocks_down: Sequence[int] = (1, 2, 2, 4),
         blocks_up: Sequence[int] = (1, 1, 1),
         dropout_prob: float | None = None,
         act=("RELU", {"inplace": True}),
         norm=("GROUP", {"num_groups": 8}),
         upsample_mode: str = "deconv",
-        use_conv_final: bool = False,
+        use_conv_final: bool = True,
         enable_heads: bool = True,
     ):
         super().__init__(enable_heads=enable_heads)
@@ -52,35 +51,34 @@ class SegResNetBackbone(AbstractBackbone):
         self._in_channels = int(in_channels)
         self._init_filters = int(init_filters)
         self._heads_dim = int(heads_dim)
-        self._head_start = int(head_start)
-        self._head_end = int(head_end)
+        self._head_indices = list(head_indices)
+        self._semantic_out_channels = int(semantic_out_channels)
+        self._use_conv_final = bool(use_conv_final)
 
         self._blocks_down = tuple(blocks_down)
         self._blocks_up = tuple(blocks_up)
 
-        # Decoder outputs in SegResNet have channels:
-        # init_filters * 2^(n_up-1), ..., init_filters
         n_up = len(self._blocks_up)
+
+        # Public convention is shallow -> deep.
         self._decoder_feature_channels = [
-            self._init_filters * (2 ** k) for k in range(n_up - 1, -1, -1)
+            self._init_filters * (2 ** k) for k in range(0, n_up)
         ]
 
-        # SegResNet downsamples by factor 2 per encoder stage after the first one,
-        # and decoder outputs reverse that. So decoder strides are:
-        # 2^(n_up-1), ..., 1   (same value on each spatial axis)
         self._decoder_strides = [
-            tuple([2 ** k] * self._spatial_dims) for k in range(n_up - 1, -1, -1)
+            tuple([2 ** k] * self._spatial_dims) for k in range(0, n_up)
         ]
 
-        # semantic_output is the final shallow decoder feature
+        # semantic_output is the highest-resolution decoder feature
+        # BEFORE semantic logits, so its channel count is init_filters.
         self._out_channels = self._init_filters
-        self._semantic_stride = tuple([1] * self._spatial_dims)
+        self._semantic_stride = tuple(self._decoder_strides[0])
 
         self.model = SegResNet(
             spatial_dims=spatial_dims,
             init_filters=init_filters,
             in_channels=in_channels,
-            out_channels=1,  # unused here because use_conv_final=False
+            out_channels=self._semantic_out_channels,
             dropout_prob=dropout_prob,
             act=act,
             norm=norm,
@@ -103,7 +101,7 @@ class SegResNetBackbone(AbstractBackbone):
     @property
     def out_channels(self) -> int:
         """
-        Channels of semantic_output.
+        Channels of semantic_output (pre-logits feature map).
         """
         return self._out_channels
 
@@ -124,18 +122,11 @@ class SegResNetBackbone(AbstractBackbone):
         return self._semantic_stride
 
     @property
-    def head_start(self) -> int:
-        return self._head_start
-
-    @property
-    def head_end(self) -> int:
-        return self._head_end
+    def head_indices(self) -> Sequence[int]:
+        return self._head_indices
 
     @property
     def filters(self):
-        """
-        Kept for compatibility with older code patterns.
-        """
         return [self._init_filters * (2 ** i) for i in range(len(self._blocks_down))]
 
     # ------------------------------------------------------------------
@@ -167,21 +158,18 @@ class SegResNetBackbone(AbstractBackbone):
 
     def _forward_decoder(self, x: Tensor, down_x: List[Tensor]) -> List[Tensor]:
         """
-        Returns decoder outputs in deep -> shallow order.
-
-        MONAI reverses down_x and then uses down_x[i + 1] as skip connections
-        during decoding. We do the same here, but also collect each decoder stage.
+        Returns decoder outputs in shallow -> deep order.
         """
         down_x = list(down_x)
         down_x.reverse()
 
-        decoder_outputs: List[Tensor] = []
+        decoder_outputs_deep_to_shallow: List[Tensor] = []
         for i, (up, upl) in enumerate(zip(self.model.up_samples, self.model.up_layers)):
             x = up(x) + down_x[i + 1]
             x = upl(x)
-            decoder_outputs.append(x)
+            decoder_outputs_deep_to_shallow.append(x)
 
-        return decoder_outputs
+        return decoder_outputs_deep_to_shallow[::-1]
 
     # ------------------------------------------------------------------
     # Required API
@@ -197,12 +185,13 @@ class SegResNetBackbone(AbstractBackbone):
                 f"got {len(decoder_outputs)}."
             )
 
-        semantic_output = decoder_outputs[-1]
+        semantic_output = decoder_outputs[0]
         return semantic_output, decoder_outputs
 
     def forward_logits(self, semantic_output: Tensor) -> Tensor:
-        """
-        Optional helper:
-        apply MONAI's built-in final conv on top of semantic_output.
-        """
+        if not self._use_conv_final:
+            raise RuntimeError(
+                "forward_logits() was called but SegResNet was created with "
+                "use_conv_final=False."
+            )
         return self.model.conv_final(semantic_output)
