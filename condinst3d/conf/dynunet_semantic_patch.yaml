@@ -18,7 +18,7 @@ train:
     iou_thresholds: [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
 
   # optional: override defaults
-  monitor: "Validation/Masks/mAP"
+  monitor: "Validation/mAP"
   monitor_mode: "max"
   save_top_k: 3
   save_last: true
@@ -100,20 +100,20 @@ model:
 
     optimizer:
       _target_: torch.optim.AdamW
-      lr: 3e-4
-      weight_decay: 5e-5
-      betas: [0.9, 0.999]
+      lr: 1e-4
+      weight_decay: 1e-4
+      betas: [ 0.9, 0.99 ]
 
     scheduler:
       _target_: torch.optim.lr_scheduler.SequentialLR
       schedulers:
         - _target_: torch.optim.lr_scheduler.LinearLR
-          start_factor: 0.1
-          total_iters: 10
+          start_factor: 0.2
+          total_iters: 5
         - _target_: torch.optim.lr_scheduler.CosineAnnealingLR
-          T_max: 990
+          T_max: 95
           eta_min: 1e-6
-      milestones: [10]
+      milestones: [ 5 ]
 
     scheduler_cfg:
       interval: epoch
@@ -142,7 +142,7 @@ data:
   empty_case_weight: 0.2
   instance_weight_power: 0.5
   max_case_weight: 3.0
-  train_num_samples: 1000
+  train_num_samples: 2500
 
   patch_size: [128, 192, 56]
   patch_overlap: 0.5

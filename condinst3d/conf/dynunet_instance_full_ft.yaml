@@ -2,7 +2,7 @@ train:
   seed: 1000
   deterministic: false
   rlimit_nofile: 1048576
-  resume: 'outputs/dynunet_instance_full/2026-03-20_06-11-56/tb/version_0/checkpoints/last.ckpt'
+  resume: null
 
   output_root: outputs
 
@@ -63,7 +63,7 @@ model:
     head_indices: [ 2, 3, 4, 5 ]
 
   finetune:
-    backbone_ckpt: null
+    backbone_ckpt: "outputs/dynunet_semantic_full/2026-03-19_17-12-48/tb/version_0/checkpoints/best_epoch=94-step=14915.ckpt"
 
   matcher:
     num_candidates: 25
@@ -138,8 +138,8 @@ model:
     num_val_images_to_show: 15
 
   optim:
-    freeze_backbone: false
-    backbone_lr_mult: 1.0
+    freeze_backbone: true
+    backbone_lr_mult: 0.1
 
     optimizer:
       _target_: torch.optim.AdamW
