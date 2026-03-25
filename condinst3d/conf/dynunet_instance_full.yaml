@@ -2,7 +2,7 @@ train:
   seed: 1000
   deterministic: false
   rlimit_nofile: 1048576
-  resume: 'outputs/dynunet_instance_full/2026-03-20_06-11-56/tb/version_0/checkpoints/last.ckpt'
+  resume: null
 
   output_root: outputs
 
@@ -54,13 +54,13 @@ model:
     spatial_dims: 3
     in_channels: 4
     out_channels: 1
-    kernel_size: [ [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 1], [ 3, 3, 3 ], [3, 3, 1] ]
-    strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [2, 2, 1] ]
-    upsample_kernel_size: [ [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [2, 2, 1] ]
-    filters: [ 32, 64, 96, 128, 192, 256, 384 ]
+    kernel_size: [ [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 3 ], [ 3, 3, 3 ], [ 3, 3, 3 ], [3, 3, 1] ]
+    strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [2, 2, 1] ]
+    upsample_kernel_size: [ [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [2, 2, 1] ]
+    filters: [ 24, 48, 96, 192, 288, 384 ]
     heads_dim: 128
-    decoder_strides: [ [ 1, 1, 1 ], [ 2, 2, 2 ], [ 4, 4, 2 ], [ 8, 8, 4 ], [ 16, 16, 4 ], [32, 32, 8] ]
-    head_indices: [ 2, 3, 4, 5 ]
+    decoder_strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 4, 4, 2 ], [ 8, 8, 4 ], [ 16, 16, 8 ] ]
+    head_indices: [ 2, 3, 4 ]
 
   finetune:
     backbone_ckpt: null
@@ -68,7 +68,7 @@ model:
   matcher:
     num_candidates: 25
     center_in_gt: true
-    anchors_sizes: [[8, 8, 2], [10, 10, 4], [14, 14, 4], [22, 26, 8]]
+    anchors_sizes: [ [ 8, 8, 2 ], [ 12, 12, 4 ], [ 18, 22, 6 ] ]
 
   heads:
     classification:
