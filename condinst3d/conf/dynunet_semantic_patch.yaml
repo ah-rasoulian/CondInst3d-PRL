@@ -31,7 +31,7 @@ train:
 
   trainer:
     accelerator: gpu
-    devices: [0]
+    devices: [0, 1, 2, 3]
     precision: bf16-mixed
     max_epochs: 100
     gradient_clip_algorithm: norm
@@ -79,7 +79,7 @@ model:
 
   inference:
     mask_thresh: 0.5
-    nms_thresh: 0.75
+    nms_thresh: 0.5
 
   evaluation:
     iou_list: [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
