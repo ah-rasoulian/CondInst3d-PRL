@@ -35,7 +35,7 @@ train:
     max_epochs: 100
     gradient_clip_algorithm: norm
     gradient_clip_val: 0.5
-    accumulate_grad_batches: 2
+    accumulate_grad_batches: 4
     num_sanity_val_steps: 0
     check_val_every_n_epoch: 5
     log_every_n_steps: 1
@@ -63,7 +63,7 @@ model:
     head_indices: [ 2, 3, 4, 5 ]
 
   finetune:
-    backbone_ckpt: "outputs/dynunet_semantic_full/2026-03-19_17-12-48/tb/version_0/checkpoints/best_epoch=94-step=14915.ckpt"
+    backbone_ckpt: ""
 
   matcher:
     num_candidates: 25

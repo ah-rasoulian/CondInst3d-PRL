@@ -12,16 +12,15 @@ class SwinUNETRBackbone(AbstractBackbone):
     """
     SwinUNETR backbone adapter for CondInst-style models.
 
-    Returned decoder_outputs are ordered:
-        deep -> shallow
-
-    and include the final semantic feature map as the last element:
-        semantic_output == decoder_outputs[-1]
+    Public convention:
+      - decoder_outputs are ordered shallow -> deep
+      - decoder_outputs[0] is the highest-resolution decoder feature map
+      - decoder_outputs[-1] is the lowest-resolution decoder feature map
 
     Notes
     -----
     - semantic_output is the final feature map BEFORE semantic logits.
-    - heads are created only from decoder outputs in [head_start, head_end].
+    - head_indices are interpreted in shallow -> deep indexing space.
     - the built-in SwinUNETR segmentation head is kept as self.model.out, but
       your CondInst model can ignore it and use its own semantic head.
     """
@@ -34,8 +33,7 @@ class SwinUNETRBackbone(AbstractBackbone):
         out_channels: int,
         feature_size: int,
         heads_dim: int,
-        head_start: int,
-        head_end: int = -1,
+        head_indices: Sequence[int],
         depths: Sequence[int] = (2, 2, 2, 2),
         num_heads: Sequence[int] = (3, 6, 12, 24),
         norm_name="instance",
@@ -52,41 +50,44 @@ class SwinUNETRBackbone(AbstractBackbone):
         super().__init__(enable_heads=enable_heads)
 
         if spatial_dims != 3:
-            raise ValueError(f"This wrapper currently expects spatial_dims=3, got {spatial_dims}.")
+            raise ValueError(
+                f"This wrapper currently expects spatial_dims=3, got {spatial_dims}."
+            )
 
         self._in_channels = int(in_channels)
-        self._out_channels = int(feature_size)  # semantic feature channels before logits
+        self._out_channels = int(feature_size)  # channels of semantic_output before logits
         self._heads_dim = int(heads_dim)
-        self._head_start = int(head_start)
-        self._head_end = int(head_end)
+        self._head_indices = list(head_indices)
         self._feature_size = int(feature_size)
         self._spatial_dims = int(spatial_dims)
 
-        # SwinUNETR decoder channels from deep -> shallow, following MONAI:
-        # dec3 = 8 * feature_size
-        # dec2 = 4 * feature_size
-        # dec1 = 2 * feature_size
-        # dec0 = 1 * feature_size
-        # out  = 1 * feature_size
+        # Public convention: shallow -> deep
+        #
+        # Native decoder traversal is:
+        #   dec3, dec2, dec1, dec0, out
+        # with strides:
+        #   16,   8,   4,   2,   1
+        # and channels:
+        #  8f,   4f,  2f,   f,   f
+        #
+        # For the public API we reverse that ordering:
+        #   out, dec0, dec1, dec2, dec3
         self._decoder_feature_channels = [
-            feature_size * 8,
-            feature_size * 4,
+            feature_size,
+            feature_size,
             feature_size * 2,
-            feature_size,
-            feature_size,
+            feature_size * 4,
+            feature_size * 8,
         ]
 
-        # SwinUNETR uses patch_size=2 and 4 hierarchical downsamplings in the transformer,
-        # so the decoder feature strides are naturally:
-        # 16, 8, 4, 2, 1 (deep -> shallow).
         self._decoder_strides = [
-            (16, 16, 16),
-            (8, 8, 8),
-            (4, 4, 4),
-            (2, 2, 2),
             (1, 1, 1),
+            (2, 2, 2),
+            (4, 4, 4),
+            (8, 8, 8),
+            (16, 16, 16),
         ]
-        self._semantic_stride = (1, 1, 1)
+        self._semantic_stride = self._decoder_strides[0]
 
         self.model = SwinUNETR(
             img_size=img_size,
@@ -129,10 +130,16 @@ class SwinUNETRBackbone(AbstractBackbone):
 
     @property
     def decoder_feature_channels(self) -> Sequence[int]:
+        """
+        Channels of raw decoder outputs in shallow -> deep order.
+        """
         return self._decoder_feature_channels
 
     @property
     def decoder_strides(self) -> Sequence[Sequence[int]]:
+        """
+        Strides of raw decoder outputs in shallow -> deep order.
+        """
         return self._decoder_strides
 
     @property
@@ -140,12 +147,8 @@ class SwinUNETRBackbone(AbstractBackbone):
         return self._semantic_stride
 
     @property
-    def head_start(self) -> int:
-        return self._head_start
-
-    @property
-    def head_end(self) -> int:
-        return self._head_end
+    def head_indices(self) -> Sequence[int]:
+        return self._head_indices
 
     @property
     def filters(self):
@@ -193,8 +196,16 @@ class SwinUNETRBackbone(AbstractBackbone):
         dec0 = self.model.decoder2(dec1, enc1)
         out = self.model.decoder1(dec0, enc0)
 
-        decoder_outputs = [dec3, dec2, dec1, dec0, out]
-        semantic_output = out
+        # Public contract: shallow -> deep
+        decoder_outputs = [out, dec0, dec1, dec2, dec3]
+        semantic_output = decoder_outputs[0]
+
+        if len(decoder_outputs) != len(self.decoder_feature_channels):
+            raise RuntimeError(
+                f"Expected {len(self.decoder_feature_channels)} decoder outputs, "
+                f"got {len(decoder_outputs)}."
+            )
+
         return semantic_output, decoder_outputs
 
     def forward_logits(self, semantic_output: Tensor) -> Tensor:

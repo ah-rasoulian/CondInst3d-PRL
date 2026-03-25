@@ -135,7 +135,7 @@ data:
     test: 0
 
   batch_size:
-    train: 4
+    train: 2
     val: 1
     test: 1
 
