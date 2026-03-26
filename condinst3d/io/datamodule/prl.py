@@ -1,5 +1,5 @@
 from typing import Any, Optional
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler, DistributedSampler
 import pytorch_lightning as pl
 import torch
 from monai.data import Dataset
@@ -405,14 +405,13 @@ class PRLDataModule(pl.LightningDataModule):
         sampler = None
         shuffle = False
 
+        is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
+
         if subset == "train":
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if is_dist:
                 world_size = torch.distributed.get_world_size()
                 rank = torch.distributed.get_rank()
 
-                # IMPORTANT:
-                # train_num_samples should be GLOBAL target if you want to preserve
-                # your old epoch size; divide by world_size for per-rank samples.
                 global_num_samples = getattr(self, "train_num_samples", len(self.cases["train"]))
                 per_rank_num_samples = math.ceil(global_num_samples / world_size)
 
@@ -432,7 +431,12 @@ class PRLDataModule(pl.LightningDataModule):
                 )
         else:
             shuffle = False
-            sampler = None
+            if is_dist:
+                sampler = DistributedSampler(
+                    dataset,
+                    shuffle=False,
+                    drop_last=False,
+                )
 
         return DataLoader(
             dataset=dataset,

@@ -71,3 +71,15 @@ class DistributedWeightedSampler(Sampler[int]):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
+
+def set_sampler_epoch(loader, epoch: int):
+    if loader is None:
+        return
+    if isinstance(loader, (list, tuple)):
+        for l in loader:
+            set_sampler_epoch(l, epoch)
+        return
+
+    sampler = getattr(loader, "sampler", None)
+    if sampler is not None and hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
