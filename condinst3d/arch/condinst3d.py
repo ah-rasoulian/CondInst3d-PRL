@@ -893,6 +893,17 @@ class CondInst3d(pl.LightningModule):
             "instance_segmentation": loss_mask,
         }
 
+    def on_train_epoch_start(self):
+        dataloader = self.trainer.train_dataloader
+
+        # handle list or single loader
+        loader = dataloader[0] if isinstance(dataloader, (list, tuple)) else dataloader
+
+        sampler = getattr(loader, "sampler", None)
+
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(self.current_epoch)
+
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
         inputs = batch["inputs"]
         targets = batch["targets"]

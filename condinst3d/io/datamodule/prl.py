@@ -8,6 +8,7 @@ from omegaconf import DictConfig, OmegaConf
 import pickle
 import json
 import os
+import math
 from monai.transforms import (
     Compose,
     LoadImaged, Lambdad, EnsureChannelFirstd, EnsureTyped, ConcatItemsd, DeleteItemsd, CropForegroundd,
@@ -21,6 +22,7 @@ from condinst3d.io.transforms import (
     MaskedPercentileNormalizeIntensityd, InstanceMaskToDetd,
     MakeBalancedInstanceWeightMapd, SymmetricGridPad
 )
+from condinst3d.io.sampler import DistributedWeightedSampler
 from condinst3d.io.collate import multi_instance_collate
 from functools import partial
 
@@ -404,13 +406,33 @@ class PRLDataModule(pl.LightningDataModule):
         shuffle = False
 
         if subset == "train":
-            sampler = WeightedRandomSampler(
-                weights=torch.as_tensor(self.train_weights, dtype=torch.double),
-                num_samples=getattr(self, "train_num_samples", len(self.cases["train"])),
-                replacement=True,
-            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                rank = torch.distributed.get_rank()
+
+                # IMPORTANT:
+                # train_num_samples should be GLOBAL target if you want to preserve
+                # your old epoch size; divide by world_size for per-rank samples.
+                global_num_samples = getattr(self, "train_num_samples", len(self.cases["train"]))
+                per_rank_num_samples = math.ceil(global_num_samples / world_size)
+
+                sampler = DistributedWeightedSampler(
+                    weights=self.train_weights,
+                    num_samples=per_rank_num_samples,
+                    replacement=True,
+                    num_replicas=world_size,
+                    rank=rank,
+                    seed=getattr(self, "seed", 0),
+                )
+            else:
+                sampler = WeightedRandomSampler(
+                    weights=torch.as_tensor(self.train_weights, dtype=torch.double),
+                    num_samples=getattr(self, "train_num_samples", len(self.cases["train"])),
+                    replacement=True,
+                )
         else:
             shuffle = False
+            sampler = None
 
         return DataLoader(
             dataset=dataset,
