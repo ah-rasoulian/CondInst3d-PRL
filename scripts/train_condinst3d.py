@@ -16,7 +16,7 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, TQDMProgressBar
 from pytorch_lightning.strategies import DDPStrategy
 
 from condinst3d.io.datamodule.prl import PRLDataModule
@@ -138,7 +138,12 @@ def setup_callbacks(cfg: DictConfig) -> List[Any]:
     lr_monitor = LearningRateMonitor(
         logging_interval=str(getattr(cfg.train, "lr_logging_interval", "step"))
     )
-    return [best_ckpt, last_ckpt, lr_monitor]
+
+    pbar = TQDMProgressBar(
+        refresh_rate=1,
+        leave=True,
+    )
+    return [best_ckpt, last_ckpt, lr_monitor, pbar]
 
 
 # -------------------- trainer/strategy --------------------
