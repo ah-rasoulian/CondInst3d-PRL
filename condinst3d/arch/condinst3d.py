@@ -16,6 +16,7 @@ from monai.transforms import Transform, Compose, KeepLargestConnectedComponent, 
 from pytorch_lightning.utilities.types import OptimizerLRScheduler, STEP_OUTPUT
 from torch.nn import BCEWithLogitsLoss
 
+from condinst3d.io.sampler import set_sampler_epoch
 from condinst3d.utils.info import extract_input_metadata
 from condinst3d.utils.spatial import aligned_trilinear
 from condinst3d.arch.backbone.abstract import AbstractBackbone
@@ -146,12 +147,14 @@ class CondInst3d(pl.LightningModule):
             self.matcher = None
             self.anchors_sizes = None
 
-        self.losses = {
-            "semantic_segmentation": instantiate(cfg.losses.semantic_segmentation),
-        }
+        self.losses = nn.ModuleDict()
+        self.losses["semantic_segmentation"] = instantiate(cfg.losses.semantic_segmentation)
 
         if self.is_instance:
-            self.losses["classification"] = instantiate(cfg.losses.classification)
+            cls_cfg = OmegaConf.to_container(cfg.losses.classification, resolve=True)
+            if "pos_weight" in cls_cfg and cls_cfg["pos_weight"] is not None:
+                cls_cfg["pos_weight"] = torch.tensor(cls_cfg["pos_weight"], dtype=torch.float32)
+            self.losses["classification"] = instantiate(cls_cfg)
             self.losses["instance_segmentation"] = instantiate(cfg.losses.instance_segmentation)
 
         self.inference_hyperparams = cfg.inference
@@ -894,15 +897,10 @@ class CondInst3d(pl.LightningModule):
         }
 
     def on_train_epoch_start(self):
-        dataloader = self.trainer.train_dataloader
+        set_sampler_epoch(self.trainer.train_dataloader, self.current_epoch)
 
-        # handle list or single loader
-        loader = dataloader[0] if isinstance(dataloader, (list, tuple)) else dataloader
-
-        sampler = getattr(loader, "sampler", None)
-
-        if sampler is not None and hasattr(sampler, "set_epoch"):
-            sampler.set_epoch(self.current_epoch)
+    def on_validation_epoch_start(self):
+        set_sampler_epoch(self.trainer.val_dataloaders, self.current_epoch)
 
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
         inputs = batch["inputs"]
