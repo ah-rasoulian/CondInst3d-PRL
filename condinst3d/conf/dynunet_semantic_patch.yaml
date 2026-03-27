@@ -30,15 +30,16 @@ train:
   ddp_backend: "nccl"
 
   trainer:
+    use_distributed_sampler: false
     accelerator: gpu
     devices: [0, 1, 2, 3]
     precision: bf16-mixed
-    max_epochs: 100
+    max_epochs: 200
     gradient_clip_algorithm: norm
     gradient_clip_val: 0.5
-    accumulate_grad_batches: 4
+    accumulate_grad_batches: 1
     num_sanity_val_steps: 0
-    check_val_every_n_epoch: 5
+    check_val_every_n_epoch: 10
     log_every_n_steps: 1
     limit_train_batches: 1.0
     limit_val_batches: 1.0
@@ -47,21 +48,24 @@ train:
 
 model:
   task_mode: semantic
-  forward_chunk_size: 16
-  max_mask_to_train: 128
+  forward_chunk_size: 12
+  max_mask_to_train: 160
 
   backbone:
     _target_: condinst3d.arch.backbone.dynunet.DynUNetBackbone
     spatial_dims: 3
     in_channels: 4
     out_channels: 1
-    kernel_size: [ [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 3 ], [ 3, 3, 3 ], [ 3, 3, 3 ], [ 3, 3, 1 ] ]
-    strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ] ]
-    upsample_kernel_size: [ [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ] ]
-    filters: [ 24, 48, 96, 192, 288, 384 ]
-    heads_dim: 128
-    decoder_strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 4, 4, 2 ], [ 8, 8, 4 ], [ 16, 16, 8 ] ]
-    head_indices: [ 2, 3, 4 ]
+    kernel_size: [ [ 3, 3, 1 ], [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 3 ], [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 1 ] ]
+    strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 1 ] ]
+    upsample_kernel_size: [ [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 1 ] ]
+    filters: [ 24, 48, 96, 192, 256, 384, 512 ]
+    heads_dim: 192
+    decoder_strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 4, 4, 2 ], [ 8, 8, 4 ], [ 16, 16, 4 ], [ 32, 32, 8 ] ]
+    head_indices: [ 2, 3, 4, 5 ]
+
+  finetune:
+    backbone_ckpt: null
 
   losses:
     semantic_segmentation:
@@ -100,7 +104,7 @@ model:
 
     optimizer:
       _target_: torch.optim.AdamW
-      lr: 1e-4
+      lr: 8e-4
       weight_decay: 1e-4
       betas: [ 0.9, 0.99 ]
 
@@ -109,11 +113,11 @@ model:
       schedulers:
         - _target_: torch.optim.lr_scheduler.LinearLR
           start_factor: 0.2
-          total_iters: 5
+          total_iters: 10
         - _target_: torch.optim.lr_scheduler.CosineAnnealingLR
-          T_max: 95
-          eta_min: 1e-6
-      milestones: [ 5 ]
+          T_max: 190
+          eta_min: 1e-5
+      milestones: [ 10 ]
 
     scheduler_cfg:
       interval: epoch
@@ -121,8 +125,8 @@ model:
       name: lr
 
 data:
-  image_mode: patch
-  full_image_size: [192, 256, 96]
+  image_mode: full   # patch or full
+  full_image_size: [192, 256, 72]
 
   root_path: "/scratch/04/public_datasets/nnDet/Task101_PRL"
   fold: 0
@@ -142,9 +146,9 @@ data:
   empty_case_weight: 0.2
   instance_weight_power: 0.5
   max_case_weight: 3.0
-  train_num_samples: 2500
+  train_num_samples: 2000
 
-  patch_size: [128, 192, 64]
+  patch_size: [128, 192, 56]
   patch_overlap: 0.5
 
   spatial_augmentation_prob: 0.25
