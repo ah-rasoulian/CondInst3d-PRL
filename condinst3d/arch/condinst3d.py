@@ -171,7 +171,7 @@ class CondInst3d(pl.LightningModule):
         metrics = torchmetrics.MetricCollection({
             "cfm": DetectionConfusionMatrix(iou_thresholds=eval_cfg.iou_list),
             "ap": AveragePrecision(iou_thresholds=eval_cfg.iou_list, interpolation=eval_cfg.ap_n_interp),
-            "gcir": GlobalConfluentInstanceRecall(iou_thresholds=0.1),
+            "gcir": GlobalConfluentInstanceRecall(iou_thresholds=eval_cfg.iou_list),
             "semantic_dice": SemanticDice(),
         })
         return metrics
@@ -481,6 +481,12 @@ class CondInst3d(pl.LightningModule):
         """
         Centralized scalar logging helper.
         """
+        if isinstance(value, torch.Tensor):
+            if not value.is_floating_point():
+                value = value.float()
+        else:
+            value = float(value)
+
         self.log(
             name,
             value,
@@ -499,6 +505,7 @@ class CondInst3d(pl.LightningModule):
             cfm: Tensor,  # [T, 3] -> TP, FP, FN
             iou_thresholds: Iterable[float],
             ap_per_thr: Optional[Tensor] = None,
+            gcir_per_thr: Optional[Tensor] = None,
     ) -> None:
         precision = compute_precision(cfm)
         recall = compute_recall(cfm)
@@ -523,6 +530,12 @@ class CondInst3d(pl.LightningModule):
                 if isinstance(ap_i, Tensor) and ap_i.numel() > 1:
                     ap_i = ap_i.mean()
                 self._log_scalar(f"{prefix}/AP@{th_str}", ap_i)
+
+            if gcir_per_thr is not None and gcir_per_thr.numel() > 0:
+                gcir_i = gcir_per_thr[i]
+                if isinstance(gcir_i, Tensor) and gcir_i.numel() > 1:
+                    gcir_i = gcir_i.mean()
+                self._log_scalar(f"{prefix}/GCIR@{th_str}", gcir_i)
 
     def on_train_start(self) -> None:
         self._assign_images_to_visualize("train", seed=42)
@@ -1658,8 +1671,16 @@ class CondInst3d(pl.LightningModule):
         mask_gcir = metric_dict["gcir"].compute()
         semantic_dice = metric_dict["semantic_dice"].compute()
 
-        self._log_scalar("Validation/mAP", mask_ap.mean())
-        self._log_scalar("Validation/GCIR", mask_gcir)
+        if isinstance(mask_ap, Tensor) and mask_ap.numel() > 0:
+            self._log_scalar("Validation/mAP", mask_ap.mean())
+        else:
+            self._log_scalar("Validation/mAP", mask_ap)
+
+        if isinstance(mask_gcir, Tensor) and mask_gcir.numel() > 0:
+            self._log_scalar("Validation/mGCIR", mask_gcir.mean())
+        else:
+            self._log_scalar("Validation/mGCIR", mask_gcir)
+
         self._log_scalar("Validation/Semantic-Dice", semantic_dice)
 
         self._log_cfm_series(
@@ -1667,8 +1688,8 @@ class CondInst3d(pl.LightningModule):
             cfm=mask_cfm,
             iou_thresholds=metric_dict["cfm"].iou_thresholds,
             ap_per_thr=mask_ap if isinstance(mask_ap, Tensor) and mask_ap.numel() > 0 else None,
+            gcir_per_thr=mask_gcir if isinstance(mask_gcir, Tensor) and mask_gcir.numel() > 0 else None,
         )
-
 
         if self.trainer is not None and self.trainer.is_global_zero:
             mask_plot_fn = getattr(metric_dict["ap"], "plot", None)
