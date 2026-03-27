@@ -125,7 +125,7 @@ model:
       name: lr
 
 data:
-  image_mode: full   # patch or full
+  image_mode: patch   # patch or full
   full_image_size: [192, 256, 72]
 
   root_path: "/scratch/04/public_datasets/nnDet/Task101_PRL"
