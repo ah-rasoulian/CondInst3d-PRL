@@ -263,8 +263,8 @@ class AveragePrecision(Metric):
         # COCO-style interpolation
         precision_curve = torch.zeros((T, R), device=device, dtype=torch.float32)
         for ti in range(T):
-            rec_t = recall[:, ti]
-            prec_t = precision[:, ti]
+            rec_t = recall[:, ti].contiguous()
+            prec_t = precision[:, ti].contiguous()
             prec_env = torch.flip(torch.cummax(torch.flip(prec_t, dims=[0]), dim=0).values, dims=[0])
 
             idx = torch.searchsorted(rec_t, recall_levels, right=False)
