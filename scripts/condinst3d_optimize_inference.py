@@ -226,16 +226,16 @@ class HyperParamOptimizer:
         )
 
         params = {
-            "mask_thresh": trial.suggest_float("mask_thresh", 0.35, 0.65),
-            "nms_thresh": trial.suggest_float("nms_thresh", 0.05, 0.50, step=0.05),
+            "mask_thresh": trial.suggest_float("mask_thresh", 0.4, 0.6, step=0.05),
+            "nms_thresh": trial.suggest_float("nms_thresh", 0.2, 0.6, step=0.05),
         }
         if self.cfg.model.task_mode == "instance":
-            params["score_thresh"] = trial.suggest_float("score_thresh", 0.2, 0.8, step=0.05)
+            params["score_thresh"] = trial.suggest_float("score_thresh", 0.1, 0.6, step=0.05)
             if self.cfg.data.image_mode == "full":
-                params["topk_candidates"] = trial.suggest_int("topk_candidates", 5, 50, step=5)
+                params["topk_candidates"] = trial.suggest_int("topk_candidates", 20, 60, step=5)
             else:
                 params["topk_candidates"] = trial.suggest_int("topk_candidates", 5, 25, step=5)
-                params["group_thresh"] = trial.suggest_float("group_thresh", 0.2, 0.8, step=0.05)
+                params["group_thresh"] = trial.suggest_float("group_thresh", 0.4, 0.8, step=0.05)
 
         self._set_inference_params(params)
 
