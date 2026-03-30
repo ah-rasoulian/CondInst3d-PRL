@@ -272,6 +272,7 @@ class Runner:
         overrides: Optional[Sequence[str] | str] = None,
         print_config: bool = False,
         ckpt_path: Optional[str] = None,
+        precision: str = "bf16-mixed",
     ) -> None:
         """
         Run validation in full precision.
@@ -288,7 +289,7 @@ class Runner:
 
         logger = setup_logger(cfg)
         callbacks = setup_callbacks(cfg)
-        trainer = setup_eval_trainer(cfg, logger=logger, callbacks=callbacks, precision="32-true")
+        trainer = setup_eval_trainer(cfg, logger=logger, callbacks=callbacks, precision=precision)
 
         final_ckpt_path = ckpt_path
         if final_ckpt_path is None:

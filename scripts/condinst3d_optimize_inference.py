@@ -145,10 +145,12 @@ class HyperParamOptimizer:
         ckpt_path: str,
         metric_key: str = "Validation/mAP",
         devices: Optional[Sequence[int] | int] = None,
+        precision: str = "bf16-mixed",
     ):
         self.cfg = cfg
         self.ckpt_path = str(Path(ckpt_path).expanduser())
         self.metric_key = metric_key
+        self.precision = precision
 
         self.dm = PRLDataModule(cfg.data)
 
@@ -164,6 +166,7 @@ class HyperParamOptimizer:
 
     def _build_trainer(self, devices: Optional[Sequence[int] | int] = None) -> Trainer:
         trainer_kwargs: Dict[str, Any] = {
+            "precision": self.precision,
             "accelerator": "gpu",
             "logger": False,
             "enable_checkpointing": False,
@@ -319,6 +322,7 @@ class Runner:
         self,
         config_name: str,
         ckpt_path: str,
+        precision: str = "bf16-mixed",
         overrides: Optional[Sequence[str] | str] = None,
         print_config: bool = False,
         n_trials: int = 25,
@@ -355,6 +359,7 @@ class Runner:
             ckpt_path=ckpt_path,
             metric_key=metric_key,
             devices=devices,
+            precision=precision,
         )
         best_params = optimizer.find_optimum(n_trials=n_trials)
 
