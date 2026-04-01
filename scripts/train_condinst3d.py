@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
-
+import json
 import fire
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
@@ -244,7 +244,7 @@ class Runner:
         resume: Optional[str] = getattr(cfg.train, "resume", None)
         ckpt_path = str(Path(resume).expanduser()) if resume else None
 
-        return cfg, model, dm, trainer, ckpt_path
+        return cfg, model, dm, trainer, ckpt_path, logger
 
     def fit(
         self,
@@ -259,7 +259,7 @@ class Runner:
             python scripts/train.py fit --config_name=condinst3d
             python scripts/train.py fit --config_name=condinst3d --overrides="train.trainer.devices=[0,1]"
         """
-        _, model, dm, trainer, ckpt_path = self._build(
+        _, model, dm, trainer, ckpt_path, _ = self._build(
             config_name=config_name,
             overrides=overrides,
             print_config=print_config,
@@ -267,31 +267,68 @@ class Runner:
         trainer.fit(model=model, datamodule=dm, ckpt_path=ckpt_path)
 
     def validate(
-        self,
-        config_name: str,
-        overrides: Optional[Sequence[str] | str] = None,
-        print_config: bool = False,
-        ckpt_path: Optional[str] = None,
-        precision: str = "bf16-mixed",
+            self,
+            config_name: str,
+            inference_hparams: Optional[str] = None,
+            overrides: Optional[Sequence[str] | str] = None,
+            print_config: bool = False,
+            ckpt_path: Optional[str] = None,
+            precision: str = "bf16-mixed",
     ) -> None:
-        """
-        Run validation in full precision.
-
-        Example:
-            python scripts/train.py validate --config_name=condinst3d
-            python scripts/train.py validate --config_name=condinst3d --ckpt_path=/path/to/best.ckpt
-        """
-        cfg, model, dm, _, resume_ckpt_path = self._build(
+        cfg, model, dm, _, resume_ckpt_path, logger = self._build(
             config_name=config_name,
             overrides=overrides,
             print_config=print_config,
         )
 
-        logger = setup_logger(cfg)
+        file_ckpt_path = None
+
+        if inference_hparams is not None:
+            hparams_path = Path(inference_hparams)
+            if not hparams_path.exists():
+                raise FileNotFoundError(f"Inference hparams file not found: {hparams_path}")
+
+            with open(hparams_path, "r") as f:
+                loaded_hparams = json.load(f)
+
+            if not isinstance(loaded_hparams, dict):
+                raise ValueError(
+                    f"Inference hparams file must contain a dictionary, got {type(loaded_hparams)}"
+                )
+
+            allowed_keys = {"score_thresh", "topk_candidates", "mask_thresh", "nms_thresh"}
+            infer_updates = {k: loaded_hparams[k] for k in allowed_keys if k in loaded_hparams}
+
+            if "inference" not in cfg or cfg.inference is None:
+                with open_dict(cfg):
+                    cfg.inference = OmegaConf.create({})
+
+            with open_dict(cfg):
+                for k, v in infer_updates.items():
+                    cfg.inference[k] = v
+
+            model.inference_hyperparams = cfg.inference
+            file_ckpt_path = loaded_hparams.get("checkpoint")
+
+            print("Loaded inference hyperparameters:")
+            for k, v in infer_updates.items():
+                print(f"  {k}: {v}")
+            if file_ckpt_path is not None:
+                print(f"  checkpoint: {file_ckpt_path}")
+
         callbacks = setup_callbacks(cfg)
-        trainer = setup_eval_trainer(cfg, logger=logger, callbacks=callbacks, precision=precision)
+        callbacks = [cb for cb in callbacks if not isinstance(cb, ModelCheckpoint)]
+
+        trainer = setup_eval_trainer(
+            cfg,
+            logger=logger,
+            callbacks=callbacks,
+            precision=precision,
+        )
 
         final_ckpt_path = ckpt_path
+        if final_ckpt_path is None:
+            final_ckpt_path = file_ckpt_path
         if final_ckpt_path is None:
             final_ckpt_path = resume_ckpt_path
 
