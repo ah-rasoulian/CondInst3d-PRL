@@ -2,7 +2,7 @@ train:
   seed: 1000
   deterministic: false
   rlimit_nofile: 1048576
-  resume: "outputs/swinunetr_instance_full/2026-04-02_14-23-24/tb/version_0/checkpoints/last.ckpt"
+  resume: null
 
   output_root: outputs
 
@@ -48,26 +48,20 @@ train:
 model:
   task_mode: instance
   forward_chunk_size: 12
-  max_mask_to_train: 100
+  max_mask_to_train: 128
 
   backbone:
-    _target_: condinst3d.arch.backbone.swinunetr.SwinUNETRBackbone
+    _target_: condinst3d.arch.backbone.dynunet.DynUNetBackbone
     spatial_dims: 3
     in_channels: 4
     out_channels: 1
-    feature_size: 24
+    kernel_size: [ [ 3, 3, 1 ], [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 3 ], [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 1 ] ]
+    strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 1 ] ]
+    upsample_kernel_size: [ [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 1 ] ]
+    filters: [ 24, 48, 96, 160, 224, 288, 384 ]
     heads_dim: 192
-    head_indices: [ 2, 3, 4 ]
-    depths: [ 2, 2, 2, 2 ]
-    num_heads: [ 3, 6, 12, 24 ]
-    norm_name: instance
-    drop_rate: 0.0
-    attn_drop_rate: 0.0
-    dropout_path_rate: 0.1
-    normalize: true
-    use_checkpoint: true
-    downsample: merging
-    use_v2: true
+    decoder_strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 4, 4, 2 ], [ 8, 8, 4 ], [ 16, 16, 4 ], [ 32, 32, 8 ] ]
+    head_indices: [ 2, 3, 4, 5 ]
 
   finetune:
     backbone_ckpt: null
@@ -76,7 +70,7 @@ model:
     num_candidates: 25
     center_in_gt: true
     min_pos: 5
-    anchors_sizes: [[8, 8, 2], [12, 12, 4], [18, 22, 6]]
+    anchors_sizes: [ [ 8, 8, 2 ], [10, 10, 4], [ 14, 14, 4 ], [ 22, 26, 8 ] ]
 
   heads:
     classification:
@@ -133,14 +127,14 @@ model:
     topk_candidates: 35
 
   evaluation:
-    iou_list: [ 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50 ]
+    iou_list: [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
     ap_n_interp: 101
 
   visualization:
-    img_channels: [ 't1w', 't2w', 'flr', 'freqmap' ]
+    img_channels: ['t1w', 't2w', 'flr', 'freqmap']
     channel_seg_under_image: 3
-    crop_size: [ 96, 96 ]
-    show_slices: [ -1, 0, 1 ]
+    crop_size: [96, 96]
+    show_slices: [-1, 0, 1]
     figsize: 1.5
     num_train_images_to_show: 5
     num_val_images_to_show: 15
@@ -173,11 +167,11 @@ model:
 
 data:
   image_mode: full   # patch or full
-  full_image_size: [192, 256, 96]
+  full_image_size: [192, 256, 72]
 
   root_path: "/scratch/04/public_datasets/nnDet/Task101_PRL"
   fold: 0
-  modalities: [ 't1w', 't2w', 'flr', 'freqmap' ]
+  modalities: ['t1w', 't2w', 'flr', 'freqmap']
   splits_path: "/scratch/04/public_datasets/nnDet/Task101_PRL/preprocessed/splits_final.pkl"
 
   num_workers:
@@ -195,7 +189,7 @@ data:
   max_case_weight: 3.0
   train_num_samples: 2000
 
-  patch_size: [ 128, 192, 64 ]
+  patch_size: [128, 192, 56]
   patch_overlap: 0.5
 
   spatial_augmentation_prob: 0.25
