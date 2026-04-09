@@ -89,6 +89,19 @@ def _load_cfg(config_name: str, overrides: Optional[Sequence[str] | str] = None)
     return cfg
 
 
+def _get_pred_directory_from_hparams(hparams_path: str) -> str:
+    """
+    Example:
+      .../tb/version_0/hyperparams/validation_last_det-params.json
+    ->
+      .../tb/version_0/hyperparams/predictions/validation_last_det-params
+    """
+    hp_path = Path(hparams_path).expanduser().resolve()
+    pred_dir = hp_path.parent / "predictions" / hp_path.stem
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    return str(pred_dir)
+
+
 # -------------------- logger --------------------
 def setup_logger(cfg: DictConfig) -> TensorBoardLogger:
     logger: TensorBoardLogger = instantiate(cfg.train.logger)
@@ -183,6 +196,7 @@ def setup_trainer(cfg: DictConfig, logger, callbacks) -> Trainer:
 
     return pl.Trainer(**trainer_kwargs)
 
+
 def setup_eval_trainer(cfg: DictConfig, logger, callbacks, precision: str = "32-true") -> Trainer:
     trainer_kwargs: Dict[str, Any] = {}
     if getattr(cfg.train, "trainer", None) is not None:
@@ -190,7 +204,7 @@ def setup_eval_trainer(cfg: DictConfig, logger, callbacks, precision: str = "32-
 
     trainer_kwargs["logger"] = logger
     trainer_kwargs["callbacks"] = callbacks
-    trainer_kwargs["precision"] = precision  # force full precision for eval
+    trainer_kwargs["precision"] = precision
 
     devices = trainer_kwargs.get("devices", 1)
     use_ddp = False
@@ -207,6 +221,7 @@ def setup_eval_trainer(cfg: DictConfig, logger, callbacks, precision: str = "32-
     trainer_kwargs.setdefault("enable_checkpointing", False)
 
     return pl.Trainer(**trainer_kwargs)
+
 
 # -------------------- runner --------------------
 class Runner:
@@ -246,19 +261,62 @@ class Runner:
 
         return cfg, model, dm, trainer, ckpt_path, logger
 
+    def _load_inference_hparams_into_model_and_cfg(
+        self,
+        cfg: DictConfig,
+        model: CondInst3d,
+        inference_hparams: str,
+    ) -> Optional[str]:
+        hparams_path = Path(inference_hparams).expanduser()
+        if not hparams_path.exists():
+            raise FileNotFoundError(f"Inference hparams file not found: {hparams_path}")
+
+        with open(hparams_path, "r") as f:
+            loaded_hparams = json.load(f)
+
+        if not isinstance(loaded_hparams, dict):
+            raise ValueError(
+                f"Inference hparams file must contain a dictionary, got {type(loaded_hparams)}"
+            )
+
+        allowed_keys = {
+            "score_thresh",
+            "topk_candidates",
+            "mask_thresh",
+            "nms_thresh",
+            "group_thresh",
+        }
+        infer_updates = {k: loaded_hparams[k] for k in allowed_keys if k in loaded_hparams}
+
+        pred_directory = _get_pred_directory_from_hparams(str(hparams_path))
+        infer_updates["pred_directory"] = pred_directory
+
+        if "inference" not in cfg or cfg.inference is None:
+            with open_dict(cfg):
+                cfg.inference = OmegaConf.create({})
+
+        with open_dict(cfg):
+            for k, v in infer_updates.items():
+                cfg.inference[k] = v
+
+        model.inference_hyperparams = cfg.inference
+
+        file_ckpt_path = loaded_hparams.get("checkpoint")
+
+        print("Loaded inference hyperparameters:")
+        for k, v in infer_updates.items():
+            print(f"  {k}: {v}")
+        if file_ckpt_path is not None:
+            print(f"  checkpoint: {file_ckpt_path}")
+
+        return file_ckpt_path
+
     def fit(
         self,
         config_name: str,
         overrides: Optional[Sequence[str] | str] = None,
         print_config: bool = False,
     ) -> None:
-        """
-        Train the model.
-
-        Example:
-            python scripts/train.py fit --config_name=condinst3d
-            python scripts/train.py fit --config_name=condinst3d --overrides="train.trainer.devices=[0,1]"
-        """
         _, model, dm, trainer, ckpt_path, _ = self._build(
             config_name=config_name,
             overrides=overrides,
@@ -267,13 +325,13 @@ class Runner:
         trainer.fit(model=model, datamodule=dm, ckpt_path=ckpt_path)
 
     def validate(
-            self,
-            config_name: str,
-            inference_hparams: Optional[str] = None,
-            overrides: Optional[Sequence[str] | str] = None,
-            print_config: bool = False,
-            ckpt_path: Optional[str] = None,
-            precision: str = "bf16-mixed",
+        self,
+        config_name: str,
+        inference_hparams: Optional[str] = None,
+        overrides: Optional[Sequence[str] | str] = None,
+        print_config: bool = False,
+        ckpt_path: Optional[str] = None,
+        precision: str = "bf16-mixed",
     ) -> None:
         cfg, model, dm, _, resume_ckpt_path, logger = self._build(
             config_name=config_name,
@@ -282,39 +340,12 @@ class Runner:
         )
 
         file_ckpt_path = None
-
         if inference_hparams is not None:
-            hparams_path = Path(inference_hparams)
-            if not hparams_path.exists():
-                raise FileNotFoundError(f"Inference hparams file not found: {hparams_path}")
-
-            with open(hparams_path, "r") as f:
-                loaded_hparams = json.load(f)
-
-            if not isinstance(loaded_hparams, dict):
-                raise ValueError(
-                    f"Inference hparams file must contain a dictionary, got {type(loaded_hparams)}"
-                )
-
-            allowed_keys = {"score_thresh", "topk_candidates", "mask_thresh", "nms_thresh"}
-            infer_updates = {k: loaded_hparams[k] for k in allowed_keys if k in loaded_hparams}
-
-            if "inference" not in cfg or cfg.inference is None:
-                with open_dict(cfg):
-                    cfg.inference = OmegaConf.create({})
-
-            with open_dict(cfg):
-                for k, v in infer_updates.items():
-                    cfg.inference[k] = v
-
-            model.inference_hyperparams = cfg.inference
-            file_ckpt_path = loaded_hparams.get("checkpoint")
-
-            print("Loaded inference hyperparameters:")
-            for k, v in infer_updates.items():
-                print(f"  {k}: {v}")
-            if file_ckpt_path is not None:
-                print(f"  checkpoint: {file_ckpt_path}")
+            file_ckpt_path = self._load_inference_hparams_into_model_and_cfg(
+                cfg=cfg,
+                model=model,
+                inference_hparams=inference_hparams,
+            )
 
         callbacks = setup_callbacks(cfg)
         callbacks = [cb for cb in callbacks if not isinstance(cb, ModelCheckpoint)]
@@ -333,6 +364,56 @@ class Runner:
             final_ckpt_path = resume_ckpt_path
 
         trainer.validate(model=model, datamodule=dm, ckpt_path=final_ckpt_path, verbose=False)
+
+    def test(
+        self,
+        config_name: str,
+        inference_hparams: Optional[str] = None,
+        overrides: Optional[Sequence[str] | str] = None,
+        print_config: bool = False,
+        ckpt_path: Optional[str] = None,
+        precision: str = "32-true",
+    ) -> None:
+        """
+        Run test-set inference and write predictions to a directory derived from
+        the inference hyperparameter JSON path.
+
+        Example:
+            python scripts/train.py test \
+                --config_name=condinst3d \
+                --inference_hparams=outputs/.../hyperparams/validation_last_det-params.json
+        """
+        cfg, model, dm, _, resume_ckpt_path, logger = self._build(
+            config_name=config_name,
+            overrides=overrides,
+            print_config=print_config,
+        )
+
+        file_ckpt_path = None
+        if inference_hparams is not None:
+            file_ckpt_path = self._load_inference_hparams_into_model_and_cfg(
+                cfg=cfg,
+                model=model,
+                inference_hparams=inference_hparams,
+            )
+
+        callbacks = setup_callbacks(cfg)
+        callbacks = [cb for cb in callbacks if not isinstance(cb, ModelCheckpoint)]
+
+        trainer = setup_eval_trainer(
+            cfg,
+            logger=logger,
+            callbacks=callbacks,
+            precision=precision,
+        )
+
+        final_ckpt_path = ckpt_path
+        if final_ckpt_path is None:
+            final_ckpt_path = file_ckpt_path
+        if final_ckpt_path is None:
+            final_ckpt_path = resume_ckpt_path
+
+        trainer.test(model=model, datamodule=dm, ckpt_path=final_ckpt_path, verbose=False)
 
 
 if __name__ == "__main__":
