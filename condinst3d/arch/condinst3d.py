@@ -11,7 +11,8 @@ import random
 import os
 from monai.data import MetaTensor
 import numpy as np
-
+import json
+import nibabel as nib
 from monai.transforms import Transform, Compose, KeepLargestConnectedComponent, RemoveSmallObjects
 from pytorch_lightning.utilities.types import OptimizerLRScheduler, STEP_OUTPUT
 from torch.nn import BCEWithLogitsLoss
@@ -1699,5 +1700,325 @@ class CondInst3d(pl.LightningModule):
 
         metric_dict.reset()
 
+
+    def _get_pred_directory(self) -> str:
+        pred_dir = self.inference_hyperparams.get("pred_directory", None)
+        if pred_dir is None:
+            raise ValueError(
+                "self.inference_hyperparams['pred_directory'] is not set. "
+                "Set it before running test()."
+            )
+        os.makedirs(pred_dir, exist_ok=True)
+        os.makedirs(os.path.join(pred_dir, "masks"), exist_ok=True)
+        os.makedirs(os.path.join(pred_dir, "json"), exist_ok=True)
+        return pred_dir
+
+    def _to_numpy(self, x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    def _center_crop_or_pad_3d(
+        self,
+        x: torch.Tensor,
+        target_shape: Tuple[int, int, int],
+        pad_value: int | float = 0,
+    ) -> torch.Tensor:
+        """
+        Symmetric center crop or symmetric pad from current spatial shape to target_shape.
+        Expects x to have shape:
+          - [H, W, D]
+          - [K, H, W, D]
+        """
+        if x.ndim not in {3, 4}:
+            raise ValueError(f"Expected 3D or 4D tensor, got shape {tuple(x.shape)}")
+
+        has_inst_dim = (x.ndim == 4)
+        if not has_inst_dim:
+            x = x.unsqueeze(0)  # [1,H,W,D]
+
+        _, h, w, d = x.shape
+        th, tw, td = map(int, target_shape)
+
+        # --- center crop if needed ---
+        sh = max((h - th) // 2, 0)
+        sw = max((w - tw) // 2, 0)
+        sd = max((d - td) // 2, 0)
+
+        eh = sh + min(h, th)
+        ew = sw + min(w, tw)
+        ed = sd + min(d, td)
+
+        x = x[:, sh:eh, sw:ew, sd:ed]
+
+        # --- symmetric pad if needed ---
+        _, h2, w2, d2 = x.shape
+        ph = max(th - h2, 0)
+        pw = max(tw - w2, 0)
+        pd = max(td - d2, 0)
+
+        if ph > 0 or pw > 0 or pd > 0:
+            pad = (
+                pd // 2, pd - pd // 2,
+                pw // 2, pw - pw // 2,
+                ph // 2, ph - ph // 2,
+            )
+            x = torch.nn.functional.pad(x, pad, mode="constant", value=pad_value)
+
+        if not has_inst_dim:
+            x = x[0]
+        return x
+
+    def _get_original_spatial_shape(self, batch: dict, i: int) -> Tuple[int, int, int]:
+        """
+        Try to infer the original pre-crop spatial shape.
+        Priority:
+          1) MetaTensor metadata from inputs / inputs_orig
+          2) fallback from foreground_end_coord
+        """
+        candidates = []
+
+        for key in ["inputs_orig", "inputs"]:
+            if key not in batch:
+                continue
+            x = batch[key]
+            try:
+                xi = x[i]
+            except Exception:
+                continue
+
+            meta = getattr(xi, "meta", None)
+            if meta is None:
+                meta = getattr(xi, "meta_dict", None)
+
+            if meta is None:
+                continue
+
+            for shape_key in ["spatial_shape", "original_shape", "shape"]:
+                if shape_key in meta and meta[shape_key] is not None:
+                    shp = tuple(int(v) for v in meta[shape_key][-3:])
+                    if len(shp) == 3:
+                        candidates.append(shp)
+
+        if len(candidates) > 0:
+            # usually first valid one is enough
+            return candidates[0]
+
+        if "foreground_end_coord" in batch:
+            end = batch["foreground_end_coord"][i]
+            end = torch.as_tensor(end).detach().cpu().tolist()
+            return tuple(int(v) for v in end)
+
+        raise RuntimeError("Could not infer original spatial shape for test prediction saving.")
+
+    def _get_affine_for_case(self, batch: dict, i: int) -> np.ndarray:
+        """
+        Use affine from MetaTensor if available; otherwise identity.
+        """
+        for key in ["inputs_orig", "inputs"]:
+            if key not in batch:
+                continue
+            x = batch[key]
+            try:
+                xi = x[i]
+            except Exception:
+                continue
+
+            affine = getattr(xi, "affine", None)
+            if affine is not None:
+                return self._to_numpy(affine)
+
+            meta = getattr(xi, "meta", None)
+            if meta is None:
+                meta = getattr(xi, "meta_dict", None)
+
+            if meta is not None and "affine" in meta and meta["affine"] is not None:
+                return self._to_numpy(meta["affine"])
+
+        return np.eye(4, dtype=np.float32)
+
+    def _restore_prediction_to_original_space(
+        self,
+        pred: Dict[str, Tensor],
+        batch: dict,
+        i: int,
+    ) -> Dict[str, Tensor]:
+        """
+        Restore processed-space prediction to original raw image space.
+
+        Steps:
+          1) undo final symmetric pad / center crop back to foreground crop size
+          2) paste into original full image using foreground_start_coord/end_coord
+        """
+        pred_instance = pred["instance_mask"]            # [H,W,D]
+        pred_onehot = pred["onehot_masks"]               # [K,H,W,D]
+        scores = pred["scores"]
+
+        fg_start = torch.as_tensor(batch["foreground_start_coord"][i], device=pred_instance.device).long()
+        fg_end = torch.as_tensor(batch["foreground_end_coord"][i], device=pred_instance.device).long()
+
+        fg_shape = tuple((fg_end - fg_start).tolist())   # cropped foreground size
+        orig_shape = self._get_original_spatial_shape(batch, i)
+
+        # bring prediction back to foreground-crop size
+        pred_instance_fg = self._center_crop_or_pad_3d(pred_instance, fg_shape, pad_value=0)
+
+        if pred_onehot.numel() == 0:
+            pred_onehot_fg = pred_onehot.new_zeros((0, *fg_shape), dtype=torch.bool)
+        else:
+            pred_onehot_fg = self._center_crop_or_pad_3d(pred_onehot, fg_shape, pad_value=0).bool()
+
+        # paste into original full image
+        restored_instance = torch.zeros(
+            orig_shape,
+            dtype=torch.long,
+            device=pred_instance.device,
+        )
+
+        s0, s1, s2 = [int(v) for v in fg_start.tolist()]
+        e0, e1, e2 = [int(v) for v in fg_end.tolist()]
+
+        restored_instance[s0:e0, s1:e1, s2:e2] = pred_instance_fg.long()
+
+        if pred_onehot_fg.shape[0] == 0:
+            restored_onehot = pred_onehot_fg
+        else:
+            restored_onehot = torch.zeros(
+                (pred_onehot_fg.shape[0], *orig_shape),
+                dtype=torch.bool,
+                device=pred_onehot_fg.device,
+            )
+            restored_onehot[:, s0:e0, s1:e1, s2:e2] = pred_onehot_fg
+
+        out = dict(pred)
+        out["instance_mask"] = restored_instance
+        out["onehot_masks"] = restored_onehot
+        out["bboxes"] = get_onehot_instance_mask_boxes(restored_onehot.unsqueeze(1)).float() \
+            if restored_onehot.shape[0] > 0 else torch.empty((0, 6), device=restored_instance.device, dtype=torch.float32)
+        out["scores"] = scores
+        return out
+
+    def _build_instance_json_dict(
+            self,
+            pred_restored: Dict[str, Tensor],
+            case_name: str,
+    ) -> Dict[str, Any]:
+        """
+        JSON schema:
+        {
+          "case": str,
+          "num_instances": int,
+          "instances": {
+              "1": {
+                  "score": float,
+                  "center": [x,y,z],
+                  "box": [...],
+                  "volume": int
+              },
+              ...
+          }
+        }
+        """
+        onehot = pred_restored["onehot_masks"]  # [K,H,W,D]
+        scores = pred_restored["scores"]
+        bboxes = pred_restored["bboxes"]
+
+        instances_dict = {}
+        K = int(onehot.shape[0])
+
+        for inst_idx in range(K):
+            mask_k = onehot[inst_idx]
+            nz = mask_k.nonzero(as_tuple=False)
+
+            # center
+            if nz.numel() == 0:
+                center = [None, None, None]
+            else:
+                center = nz.float().mean(dim=0).detach().cpu().tolist()
+
+            # box
+            box = (
+                bboxes[inst_idx].detach().cpu().tolist()
+                if inst_idx < len(bboxes)
+                else None
+            )
+
+            # score
+            score = (
+                float(scores[inst_idx].detach().cpu().item())
+                if inst_idx < len(scores)
+                else None
+            )
+
+            # volume (number of voxels)
+            volume = int(mask_k.sum().item())
+
+            instances_dict[str(inst_idx + 1)] = {
+                "score": score,
+                "center": center,
+                "box": box,
+                "volume": volume,
+            }
+
+        return {
+            "case": case_name,
+            "num_instances": K,
+            "instances": instances_dict,
+        }
+
+    def _save_case_prediction(
+        self,
+        case_name: str,
+        pred_restored: Dict[str, Tensor],
+        batch: dict,
+        i: int,
+    ) -> None:
+        pred_dir = self._get_pred_directory()
+
+        mask_out = os.path.join(pred_dir, "masks", f"{case_name}.nii.gz")
+        json_out = os.path.join(pred_dir, "json", f"{case_name}.json")
+
+        affine = self._get_affine_for_case(batch, i)
+        instance_mask_np = pred_restored["instance_mask"].detach().cpu().numpy().astype(np.int32)
+
+        nib.save(
+            nib.Nifti1Image(instance_mask_np, affine),
+            mask_out,
+        )
+
+        json_dict = self._build_instance_json_dict(
+            pred_restored=pred_restored,
+            case_name=case_name,
+        )
+        with open(json_out, "w") as f:
+            json.dump(json_dict, f, indent=4)
+
     def test_step(self, batch: dict, batch_idx, dataloader_idx=0) -> STEP_OUTPUT:
-        pass
+        preds = self.predict_step(batch, batch_idx, dataloader_idx=dataloader_idx)
+        cases = batch.get("case", None)
+
+        if cases is None:
+            raise ValueError("Batch must contain 'case' during test.")
+
+        saved_preds = []
+
+        for i, pred in enumerate(preds):
+            case_name = str(cases[i])
+
+            pred_restored = self._restore_prediction_to_original_space(
+                pred=pred,
+                batch=batch,
+                i=i,
+            )
+
+            self._save_case_prediction(
+                case_name=case_name,
+                pred_restored=pred_restored,
+                batch=batch,
+                i=i,
+            )
+
+            saved_preds.append(pred_restored)
+
+        return saved_preds
+
