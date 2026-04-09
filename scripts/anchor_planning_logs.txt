@@ -1,0 +1,25 @@
+3-levels:
+Best anchors in voxels:
+[[ 8  8  2]
+ [12 12  4]
+ [18 22  6]]
+Best anchors in mm:
+[[ 6.4  6.4  4. ]
+ [ 9.6  9.6  8. ]
+ [14.4 17.6 12. ]]
+Best metrics:
+{'score': 0.5632553762287577, 'mean_best_iou': 0.5932553762287577, 'median_best_iou': 0.5833333369551433, 'recall_iou_ge_0.25': 0.9784385324291428, 'recall_iou_ge_0.50': 0.701095461658842}
+
+4-levels:
+Best anchors in voxels:
+[[ 8  8  2]
+ [10 10  4]
+ [14 14  4]
+ [22 26  8]]
+Best anchors in mm:
+[[ 6.4  6.4  4. ]
+ [ 8.   8.   8. ]
+ [11.2 11.2  8. ]
+ [17.6 20.8 16. ]]
+Best metrics:
+{'score': 0.5718251203525486, 'mean_best_iou': 0.6118251203525487, 'median_best_iou': 0.6086956502021146, 'recall_iou_ge_0.25': 0.9800034776560598, 'recall_iou_ge_0.50': 0.7412623891497131}

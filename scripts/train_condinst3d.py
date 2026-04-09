@@ -97,7 +97,7 @@ def _get_pred_directory_from_hparams(hparams_path: str) -> str:
       .../tb/version_0/hyperparams/predictions/validation_last_det-params
     """
     hp_path = Path(hparams_path).expanduser().resolve()
-    pred_dir = hp_path.parent / "predictions" / hp_path.stem
+    pred_dir = hp_path.parent.parent / "predictions"
     pred_dir.mkdir(parents=True, exist_ok=True)
     return str(pred_dir)
 
@@ -373,21 +373,14 @@ class Runner:
         print_config: bool = False,
         ckpt_path: Optional[str] = None,
         precision: str = "32-true",
+        devices: Optional[Sequence[int] | int] = None,
     ) -> None:
-        """
-        Run test-set inference and write predictions to a directory derived from
-        the inference hyperparameter JSON path.
-
-        Example:
-            python scripts/train.py test \
-                --config_name=condinst3d \
-                --inference_hparams=outputs/.../hyperparams/validation_last_det-params.json
-        """
-        cfg, model, dm, _, resume_ckpt_path, logger = self._build(
+        cfg, model, dm, _, resume_ckpt_path, _ = self._build(  # ignore logger here
             config_name=config_name,
             overrides=overrides,
             print_config=print_config,
         )
+        logger = False
 
         file_ckpt_path = None
         if inference_hparams is not None:
@@ -399,6 +392,12 @@ class Runner:
 
         callbacks = setup_callbacks(cfg)
         callbacks = [cb for cb in callbacks if not isinstance(cb, ModelCheckpoint)]
+
+        if devices is not None:
+            with open_dict(cfg):
+                if "trainer" not in cfg.train:
+                    cfg.train.trainer = {}
+                cfg.train.trainer.devices = devices
 
         trainer = setup_eval_trainer(
             cfg,
