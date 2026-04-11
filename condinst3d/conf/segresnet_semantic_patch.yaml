@@ -26,7 +26,6 @@ train:
   lr_logging_interval: "step"
 
   ddp_backend: "nccl"
-  find_unused_parameters: true
 
   trainer:
     use_distributed_sampler: false
@@ -46,7 +45,7 @@ train:
     enable_model_summary: true
 
 model:
-  task_mode: instance
+  task_mode: semantic
   forward_chunk_size: 12
   max_mask_to_train: 128
 
@@ -71,46 +70,7 @@ model:
   finetune:
     backbone_ckpt: null
 
-  matcher:
-    num_candidates: 25
-    center_in_gt: true
-    min_pos: 5
-    anchors_sizes: [ [ 8, 8, 2 ], [ 12, 12, 4 ], [ 18, 22, 6 ] ]
-
-  heads:
-    classification:
-      num_classes: 1
-      prior_probability: 0.01
-
-    instance_segmentation:
-      channels: 8
-      num_layers: 3
-      kernel_size: 1
-      size_of_interest: 4
-      max_batch_size: 16
-
   losses:
-    classification:
-      _target_: torch.nn.BCEWithLogitsLoss
-      reduction: "none"
-
-    classification_mining:
-      hard_negative_ratio: 3
-      hard_negative_min: 32
-
-    instance_segmentation:
-      _target_: condinst3d.losses.generalized_dice_bce.GeneralizedDiceBCELoss
-      include_background: true
-      sigmoid: true
-      softmax: false
-      w_type: square
-      smooth_nr: 1e-5
-      smooth_dr: 1e-5
-      lambda_gdice: 1.0
-      lambda_bce: 0.5
-      pos_weight: 5.0
-      reduction: mean
-
     semantic_segmentation:
       _target_: condinst3d.losses.generalized_dice_bce.GeneralizedDiceBCELoss
       include_background: true
@@ -126,10 +86,7 @@ model:
 
   inference:
     mask_thresh: 0.5
-    score_thresh: 0.5
     nms_thresh: 0.5
-    group_thresh: 0.25
-    topk_candidates: 35
 
   evaluation:
     iou_list: [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
@@ -171,7 +128,7 @@ model:
       name: lr
 
 data:
-  image_mode: full   # patch or full
+  image_mode: patch   # patch or full
   full_image_size: [192, 256, 80]
 
   root_path: "/scratch/04/public_datasets/nnDet/Task101_PRL"
