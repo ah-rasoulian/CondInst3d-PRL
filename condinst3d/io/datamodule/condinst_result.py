@@ -5,40 +5,65 @@ from monai.data import Dataset
 from pytorch_lightning.utilities.types import EVAL_DATALOADERS
 from torch.utils.data import DataLoader
 import torch
-import numpy as np
-from monai.transforms import (Compose, LoadImaged, EnsureChannelFirstd, ConcatItemsd, DeleteItemsd, Lambdad, CopyItemsd,
-                              ToTensord)
-from condinst3d.io.transforms import (LoadInfod, InstanceMaskToDetd, SemanticToInstanced, FilterAndUnpackPredsd,
-                                      MatchSegBoxesToPredScoresd, MaskedPercentileNormalizeIntensityd)
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    ConcatItemsd,
+    DeleteItemsd,
+    Lambdad,
+    CopyItemsd,
+    ToTensord,
+)
+from condinst3d.io.transforms import (
+    LoadInfod,
+    InstanceMaskToDetd,
+    MaskedPercentileNormalizeIntensityd,
+)
 from functools import partial
 from condinst3d.io.collate import multi_instance_collate
 
 
 class CondInstResult(pl.LightningDataModule):
     def __init__(
-            self,
-            split_root,
-            pred_root,
-            n_modalities,
-            n_workers = 0,
+        self,
+        split_root,
+        pred_root,
+        n_modalities,
+        n_workers=0,
     ):
         super().__init__()
 
-        test_images_dir = os.path.join(split_root, 'imagesTs')
-        test_labels_dir = os.path.join(split_root, 'labelsTs')
-        case_names = [f.removesuffix(".nii.gz") for f in os.listdir(test_labels_dir) if f.endswith("nii.gz")]
+        test_images_dir = os.path.join(split_root, "imagesTs")
+        test_labels_dir = os.path.join(split_root, "labelsTs")
+
+        pred_masks_dir = os.path.join(pred_root, "masks")
+        pred_json_dir = os.path.join(pred_root, "json")
+
+        case_names = [
+            f.removesuffix(".nii.gz")
+            for f in os.listdir(test_labels_dir)
+            if f.endswith(".nii.gz")
+        ]
+
         cases = []
         for case_name in case_names:
             case_dict = {
                 "case": case_name,
-                "brain_mask": os.path.join(test_images_dir, "brainmask", f"{case_name}_brainmask.nii.gz"),
+                "brain_mask": os.path.join(
+                    test_images_dir, "brainmask", f"{case_name}_brainmask.nii.gz"
+                ),
                 "instance_mask": os.path.join(test_labels_dir, f"{case_name}.nii.gz"),
                 "instance_mask_info": os.path.join(test_labels_dir, f"{case_name}.json"),
-                "pred_info": os.path.join(pred_root, f"{case_name}_pred.json"),
-                "pred_seg": os.path.join(pred_root, f"{case_name}_pred.nii.gz"),
+                "pred_info": os.path.join(pred_json_dir, f"{case_name}.json"),
+                "pred_seg": os.path.join(pred_masks_dir, f"{case_name}.nii.gz"),
             }
+
             for i in range(n_modalities):
-                case_dict[f"modality-{i}"] = os.path.join(test_images_dir, f"{case_name}_{i:04d}.nii.gz")
+                case_dict[f"modality-{i}"] = os.path.join(
+                    test_images_dir, f"{case_name}_{i:04d}.nii.gz"
+                )
+
             cases.append(case_dict)
 
         self.cases = cases
@@ -48,15 +73,26 @@ class CondInstResult(pl.LightningDataModule):
 
         self.collate_fn = partial(
             multi_instance_collate,
-            collate_keys=['inputs', 'instance_mask', 'semantic_mask', 'gt_onehot', 'gt_boxes', 'gt_classes',
-                          'pred_seg', 'pred_onehot', 'pred_boxes', 'pred_classes', 'pred_scores'],
+            collate_keys=[
+                "inputs",
+                "instance_mask",
+                "semantic_mask",
+                "gt_onehot",
+                "gt_boxes",
+                "gt_classes",
+                "pred_seg",
+                "pred_onehot",
+                "pred_boxes",
+                "pred_classes",
+                "pred_scores",
+            ],
             target_keys={
                 "targets": {
                     "instance_mask": "instance_mask",
                     "semantic_mask": "semantic_mask",
                     "gt_onehot": "onehot",
                     "gt_boxes": "boxes",
-                    "gt_classes": "classes"
+                    "gt_classes": "classes",
                 },
                 "preds": {
                     "pred_seg": "instance_mask",
@@ -65,8 +101,45 @@ class CondInstResult(pl.LightningDataModule):
                     "pred_classes": "classes",
                     "pred_scores": "scores",
                 },
-            }
+            },
         )
+
+    def _extract_pred_scores(self, pred_info):
+        """
+        New JSON format:
+        {
+            "case": "...",
+            "num_instances": K,
+            "instances": {
+                "1": {"score": ..., "center": ..., "box": ..., "volume": ...},
+                ...
+            }
+        }
+
+        Returns scores ordered by instance id: 1, 2, 3, ...
+        This matches the labeling in the saved instance mask.
+        """
+        instances = pred_info.get("instances", {})
+        if not isinstance(instances, dict) or len(instances) == 0:
+            return []
+
+        def _instance_key_sort(k):
+            try:
+                return int(k)
+            except Exception:
+                return k
+
+        ordered_keys = sorted(instances.keys(), key=_instance_key_sort)
+
+        scores = []
+        for k in ordered_keys:
+            item = instances[k]
+            score = item.get("score", 0.0)
+            if score is None:
+                score = 0.0
+            scores.append(float(score))
+
+        return scores
 
     def _get_load_transforms(self):
         return [
@@ -75,28 +148,30 @@ class CondInstResult(pl.LightningDataModule):
             LoadInfod(keys=["pred_info"]),
 
             CopyItemsd(keys=["pred_info"], times=1, names=["pred_scores"]),
-            Lambdad(keys=["pred_scores"], func=lambda x: x["scores"]),
-            ToTensord(keys=["pred_scores"]),
+            Lambdad(keys=["pred_scores"], func=self._extract_pred_scores),
+            ToTensord(keys=["pred_scores"], dtype=torch.float32),
 
             CopyItemsd(keys=["instance_mask"], times=1, names=["semantic_mask"]),
             Lambdad(keys=["semantic_mask"], func=lambda x: (x > 0).float()),
 
-            EnsureChannelFirstd(keys=self.modalities + ["instance_mask", "semantic_mask", "pred_seg"], channel_dim='no_channel'),
+            EnsureChannelFirstd(
+                keys=self.modalities + ["instance_mask", "semantic_mask", "pred_seg"],
+                channel_dim="no_channel",
+            ),
             ConcatItemsd(keys=self.modalities, name="inputs", dim=0),
 
-            # normalize input intensities
             MaskedPercentileNormalizeIntensityd(
                 keys=["inputs"],
                 mask_key="brain_mask",
                 percentiles=(0.5, 99.5),
                 channel_wise=True,
             ),
-            DeleteItemsd(self.modalities + ["pred_boxes", "brain_mask"]),
+
+            DeleteItemsd(keys=self.modalities + ["brain_mask"]),
         ]
 
     def _get_det_transforms(self):
         return [
-            # create boxes, class and onehot tensors
             InstanceMaskToDetd(
                 instance_key="instance_mask",
                 onehot_key="gt_onehot",
@@ -113,10 +188,9 @@ class CondInstResult(pl.LightningDataModule):
             ),
         ]
 
-    def setup(self, stage):
+    def setup(self, stage=None):
         t = self._get_load_transforms()
         t += self._get_det_transforms()
-
         self.dataset = Dataset(data=self.cases, transform=Compose(t))
 
     def transfer_batch_to_device(self, batch: Any, device: torch.device, dataloader_idx: int) -> Any:
@@ -125,32 +199,25 @@ class CondInstResult(pl.LightningDataModule):
                 for i, v in enumerate(iterable):
                     if isinstance(v, torch.Tensor):
                         iterable[i] = v.to(device)
-                    elif isinstance(v, list) or isinstance(v, dict):
+                    elif isinstance(v, (list, dict)):
                         move_iterable_to_device(v)
-                    else:
-                        continue
-            if isinstance(iterable, dict):
+            elif isinstance(iterable, dict):
                 for k, v in iterable.items():
                     if isinstance(v, torch.Tensor):
                         iterable[k] = v.to(device)
-                    elif isinstance(v, list) or isinstance(v, dict):
+                    elif isinstance(v, (list, dict)):
                         move_iterable_to_device(v)
-                    else:
-                        continue
 
         if isinstance(device, str):
             device = torch.device(device)
 
         if isinstance(batch, tuple):
-            if len(batch[0]) == 2:
-                for v in batch[0].values():
-                    move_iterable_to_device(v)
-            else:
+            if len(batch) > 0 and isinstance(batch[0], dict):
                 move_iterable_to_device(batch[0])
         else:
             move_iterable_to_device(batch)
-        return batch
 
+        return batch
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
         return DataLoader(
@@ -158,6 +225,5 @@ class CondInstResult(pl.LightningDataModule):
             batch_size=1,
             shuffle=False,
             num_workers=self.n_workers,
-            collate_fn=self.collate_fn
+            collate_fn=self.collate_fn,
         )
-

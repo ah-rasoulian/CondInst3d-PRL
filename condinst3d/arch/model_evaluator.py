@@ -1,24 +1,42 @@
 from typing import Any, Dict, List, Optional, Iterable
 import random
+
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import DataLoader
-from condinst3d.evaluator.iou import mask_intersection_over_union, box_intersection_over_union
-from condinst3d.utils.detection import onehot_to_instance_mask
-from condinst3d.visualization.utils import get_stats
-from condinst3d.evaluator.metrics.cfm_based import compute_precision, compute_fi, compute_recall
-from condinst3d.evaluator.metrics import AveragePrecision, DetectionConfusionMatrix, GlobalConfluentInstanceRecall, DetectionFROC
-from condinst3d.utils.mask import build_gt_cluster_ids
-from condinst3d.visualization.list_instance_boxseg_visualizer import ListInstanceBoxSegSliceVisualizer
 import torchmetrics
 import matplotlib.pyplot as plt
-from pathlib import Path
+
+from condinst3d.evaluator.iou import mask_intersection_over_union
+from condinst3d.utils.detection import onehot_to_instance_mask
+from condinst3d.visualization.utils import get_stats
+from condinst3d.evaluator.metrics.cfm_based import (
+    compute_precision,
+    compute_fi,
+    compute_recall,
+)
+from condinst3d.evaluator.metrics import (
+    AveragePrecision,
+    DetectionConfusionMatrix,
+    GlobalConfluentInstanceRecall,
+    DetectionFROC,
+    SemanticDice,
+)
+from condinst3d.utils.mask import build_gt_cluster_ids
+from condinst3d.visualization.list_instance_boxseg_visualizer import (
+    ListInstanceBoxSegSliceVisualizer,
+)
+
 
 @torch.no_grad()
-def plot_froc_curve(curve: Dict[str, torch.Tensor], fppi_max: float = 8.0, title: str = "FROC"):
+def plot_froc_curve(
+    curve: Dict[str, torch.Tensor],
+    fppi_max: float = 8.0,
+    title: str = "FROC",
+):
     x = curve["fppi"].detach().cpu()
     y = curve["sensitivity"].detach().cpu()
 
@@ -35,61 +53,49 @@ def plot_froc_curve(curve: Dict[str, torch.Tensor], fppi_max: float = 8.0, title
 
 
 def _to_float(x: Tensor | float) -> Tensor | float:
-    # keep tensors as tensors (Lightning likes tensors), but avoid accidental MetaTensor issues
     return x
 
 
 def _safe_mean(x: Tensor) -> Tensor:
-    # some AP implementations return shape [T] or [T, ...]
     return x.mean() if x.numel() else x.new_tensor(0.0)
 
 
 def _squeeze_onehot(onehot: torch.Tensor) -> torch.Tensor:
-    # Normalize to [N,H,W,D]
     if onehot.ndim == 5 and onehot.shape[1] == 1:
         return onehot.squeeze(1)
     return onehot
 
-def _ensure_boxes_2d(boxes: torch.Tensor, name: str) -> torch.Tensor:
-    # Accept empty [0,6], [6], or [G,6]
-    if boxes.numel() == 0:
-        return boxes.reshape(0, 6)
-    if boxes.ndim == 1:
-        boxes = boxes.unsqueeze(0)
-    assert boxes.ndim == 2 and boxes.shape[1] == 6, f"{name} must be [N,6], got {tuple(boxes.shape)}"
-    return boxes
-
 
 class ModelEvaluator(pl.LightningModule):
     def __init__(
-            self,
-            target_key,
-            pred_key,
+        self,
+        target_key: str,
+        pred_key: str,
+        iou_list: Optional[Iterable[float]] = None,
     ):
         super().__init__()
         self.pred_key = pred_key
         self.target_key = target_key
 
-        iou_list = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
-        # -------------------- metrics --------------------
+        if iou_list is None:
+            iou_list = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+        self.iou_list = [float(x) for x in iou_list]
+
         self.metrics = nn.ModuleDict({
             "test": torchmetrics.MetricCollection({
-                "mask_cfm": DetectionConfusionMatrix(iou_thresholds=iou_list),
-                "mask_ap": AveragePrecision(iou_thresholds=iou_list),
-                "mask_gcir": GlobalConfluentInstanceRecall(iou_thresholds=0.1),
-                "mask_froc": DetectionFROC(
+                "cfm": DetectionConfusionMatrix(iou_thresholds=self.iou_list),
+                "ap": AveragePrecision(iou_thresholds=self.iou_list),
+                "gcir": GlobalConfluentInstanceRecall(iou_thresholds=self.iou_list),
+                "froc": DetectionFROC(
                     iou_thr=0.10,
                     n_thresholds=200,
                     score_min=0.0,
                     score_max=1.0,
                 ),
-
-                "box_cfm": DetectionConfusionMatrix(iou_thresholds=iou_list),
-                "box_ap": AveragePrecision(iou_thresholds=iou_list),
+                "semantic_dice": SemanticDice(),
             })
         })
 
-        # -------------------- visualization --------------------
         img_channels = ["t1w", "t2w", "flr", "freqmap"]
         self.instance_head_visualizer = ListInstanceBoxSegSliceVisualizer(
             crop_size=(96, 96),
@@ -100,28 +106,21 @@ class ModelEvaluator(pl.LightningModule):
             img_channels=img_channels + ["semantic_mask"],
             channel_seg_under_image=3,
         )
+
         self.images_to_visualize: Dict[int, List[int]] = {}
         self.num_images_to_show = int(16)
 
     def _get_single_test_loader(self) -> DataLoader:
-        """You said you only have one val dataloader."""
         test_loader = self.trainer.test_dataloaders
         if isinstance(test_loader, list):
-            # take the first; you said only 1 exists
             return test_loader[0]
         return test_loader
 
     def _assign_images_to_visualize(self, seed: int = 42) -> None:
-        """
-        Pick a fixed set of batch indices to visualize from the (single) val dataloader.
-        Stores them in self.images_to_visualize[0] as a sorted list[int].
-        """
         if not self.trainer or not self.trainer.is_global_zero:
             return
 
         loader = self._get_single_test_loader()
-
-        # If your loader doesn't have __len__ (iterable-style), just do nothing
         if not hasattr(loader, "__len__"):
             self.images_to_visualize = {0: []}
             return
@@ -135,183 +134,157 @@ class ModelEvaluator(pl.LightningModule):
             chosen = list(range(n_batches))
         else:
             k = min(int(self.num_images_to_show), n_batches)
-            rng = random.Random(seed)  # doesn't touch global RNG
-            chosen = rng.sample(range(n_batches), k=k)
-            chosen.sort()
+            rng = random.Random(seed)
+            chosen = sorted(rng.sample(range(n_batches), k=k))
 
         self.images_to_visualize = {0: chosen}
 
     def on_test_start(self) -> None:
-        # Choose once per fit unless user changed params.
         if not getattr(self, "images_to_visualize", None):
             self._assign_images_to_visualize()
 
-    def test_step(self, batch: dict, batch_idx: int) -> Any:
-        targets = batch[self.target_key]  # list[dict]
-        pred = batch[self.pred_key]
-        has_mask = "onehot" in pred[0]
+    def test_step(self, batch: dict, batch_idx: int) -> STEP_OUTPUT:
+        targets = batch[self.target_key]
+        preds = batch[self.pred_key]
 
         metric_dict = self.metrics["test"]
 
-        # -------- metrics (fast path) --------
-        for det, tgt in zip(pred, targets):
-            scores = det["scores"]  # [K]
+        for i, (det, tgt) in enumerate(zip(preds, targets)):
+            scores = det["scores"]
 
-            # --- boxes ---
-            pred_boxes = _ensure_boxes_2d(det["boxes"], "pred_boxes")
-            gt_boxes = _ensure_boxes_2d(tgt["boxes"], "gt_boxes")
+            pred_onehot = _squeeze_onehot(det["onehot"])
+            gt_onehot = _squeeze_onehot(tgt["onehot"])
 
-            pairwise_box_iou = box_intersection_over_union(pred_boxes, gt_boxes)  # [K,G]
-            metric_dict["box_cfm"].update(pairwise_box_iou, scores)
-            metric_dict["box_ap"].update(pairwise_box_iou, scores)
-
-            if has_mask:
-            # --- masks ---
-                pred_onehot = _squeeze_onehot(det["onehot"])  # [K,H,W,D]
-                gt_onehot = _squeeze_onehot(tgt["onehot"])  # [G,H,W,D]
-
-                pairwise_mask_iou = mask_intersection_over_union(
-                    pred_onehot, gt_onehot, max_chunk_size=32
+            # semantic dice
+            if pred_onehot.shape[0] == 0:
+                semantic_pred = torch.zeros(
+                    gt_onehot.shape[1:],
+                    device=gt_onehot.device,
+                    dtype=torch.bool,
                 )
-                metric_dict["mask_cfm"].update(pairwise_mask_iou, scores)
-                metric_dict["mask_ap"].update(pairwise_mask_iou, scores)
+            else:
+                semantic_pred = pred_onehot.any(dim=0)
 
-                gt_cluster_ids = build_gt_cluster_ids(
-                    semantic_mask=tgt["semantic_mask"][0],
-                    instance_mask=tgt["instance_mask"][0],
-                    connectivity=26,
-                    min_instances_in_cluster=2,
+            if gt_onehot.shape[0] == 0:
+                semantic_gt = torch.zeros(
+                    pred_onehot.shape[1:],
+                    device=pred_onehot.device,
+                    dtype=torch.bool,
                 )
-                metric_dict["mask_gcir"].update(pairwise_mask_iou, scores, gt_cluster_ids)
-                metric_dict["mask_froc"].update(pairwise_mask_iou, scores)
+            else:
+                semantic_gt = gt_onehot.any(dim=0)
 
-        if has_mask:
-            # -------- visualization gate --------
-            vis_indices = set(self.images_to_visualize.get(0, []))
-            do_vis = self.trainer.is_global_zero and (batch_idx in vis_indices)
-            if not do_vis:
-                return
+            metric_dict["semantic_dice"].update(semantic_pred, semantic_gt)
 
-            # Prefer full-volume input for plotting (no patch stitching)
-            inputs_full = batch.get("inputs")
-            cases = batch.get("case", None)
+            pairwise_mask_iou = mask_intersection_over_union(
+                pred_onehot,
+                gt_onehot,
+                max_chunk_size=32,
+            )
+            metric_dict["cfm"].update(pairwise_mask_iou, scores)
+            metric_dict["ap"].update(pairwise_mask_iou, scores)
 
-            for i, (det, tgt) in enumerate(zip(pred, targets)):
-                semantic_gt = tgt["semantic_mask"]
-                img_to_show = torch.cat([inputs_full[i], semantic_gt], dim=0)
+            gt_cluster_ids = build_gt_cluster_ids(
+                semantic_mask=tgt["semantic_mask"][0],
+                instance_mask=tgt["instance_mask"][0],
+                connectivity=26,
+                min_instances_in_cluster=2,
+            )
+            metric_dict["gcir"].update(pairwise_mask_iou, scores, gt_cluster_ids)
+            metric_dict["froc"].update(pairwise_mask_iou, scores)
 
-                scores = det["scores"]
+        vis_indices = set(self.images_to_visualize.get(0, []))
+        do_vis = self.trainer.is_global_zero and (batch_idx in vis_indices)
+        if not do_vis:
+            return
 
-                gt_onehot = _squeeze_onehot(tgt["onehot"])
-                pred_onehot = _squeeze_onehot(det["onehot"])
+        inputs_full = batch.get("inputs")
+        cases = batch.get("case", None)
 
-                y_true = onehot_to_instance_mask(gt_onehot)
-                y_pred = det["instance_mask"]
+        for i, (det, tgt) in enumerate(zip(preds, targets)):
+            semantic_gt = tgt["semantic_mask"]
+            img_to_show = torch.cat([inputs_full[i], semantic_gt], dim=0)
 
-                true_ids = torch.unique(y_true)
-                true_ids = true_ids[true_ids > 0]
-                pred_ids = torch.unique(y_pred)
-                pred_ids = pred_ids[pred_ids > 0]
+            scores = det["scores"]
+            gt_onehot = _squeeze_onehot(tgt["onehot"])
+            pred_onehot = _squeeze_onehot(det["onehot"])
 
-                pairwise_mask_iou = mask_intersection_over_union(pred_onehot, gt_onehot)
-                stats = get_stats(pairwise_mask_iou, y_true_ids=true_ids, y_pred_ids=pred_ids, scores=scores)
+            y_true = onehot_to_instance_mask(gt_onehot)
+            y_pred = det["instance_mask"]
 
-                title = str(cases[i]) if cases is not None else f"idx={i}"
+            true_ids = torch.unique(y_true)
+            true_ids = true_ids[true_ids > 0]
+            pred_ids = torch.unique(y_pred)
+            pred_ids = pred_ids[pred_ids > 0]
 
-                figs = self.instance_head_visualizer.plot(
-                    inputs=img_to_show,
-                    y_pred=y_pred,
-                    y_true=y_true,
-                    stats=[stats],
-                    title=title,
-                    add_info_text=True,
-                    boxes_true=tgt.get("boxes", None),
-                    boxes_pred=det.get("bboxes", None),
-                    boxes_scores=det.get("scores", None),
-                )
+            pairwise_mask_iou = mask_intersection_over_union(pred_onehot, gt_onehot)
+            stats = get_stats(
+                pairwise_mask_iou,
+                y_true_ids=true_ids,
+                y_pred_ids=pred_ids,
+                scores=scores,
+            )
 
-                for t, fig in figs.items():
-                    self._log_figure(f"Images-{title}/{t}", fig)
-                    try:
-                        import matplotlib.pyplot as plt
-                        plt.close(fig)
-                    except Exception:
-                        pass
+            title = str(cases[i]) if cases is not None else f"idx={i}"
+
+            figs = self.instance_head_visualizer.plot(
+                inputs=img_to_show,
+                y_pred=y_pred,
+                y_true=y_true,
+                stats=[stats],
+                title=title,
+                add_info_text=True,
+                boxes_true=tgt.get("boxes", None),
+                boxes_pred=det.get("bboxes", None),
+                boxes_scores=det.get("scores", None),
+            )
+
+            for t, fig in figs.items():
+                self._log_figure(f"Images-{title}/{t}", fig, close=True)
 
         return
 
     def on_test_epoch_end(self) -> None:
-        """
-                Single validation dataloader: log BOTH mask and box metrics.
-                Assumes self.metrics["validation"]["0"] contains:
-                  - mask_cfm, mask_ap
-                  - box_cfm, box_ap
-                with .compute(), .plot() and .reset().
-                """
         metric_dict = self.metrics["test"]
 
-        # ---------------- Boxes ----------------
-        box_cfm: Tensor = metric_dict["box_cfm"].compute()  # [T,3]
-        box_ap: Tensor = metric_dict["box_ap"].compute()  # [T] or [T,...]
-        box_fig, _ = metric_dict["box_ap"].plot()
+        mask_cfm = metric_dict["cfm"].compute()
+        mask_ap = metric_dict["ap"].compute()
+        mask_gcir = metric_dict["gcir"].compute()
+        semantic_dice = metric_dict["semantic_dice"].compute()
 
-        self._log_figure("Boxes/PR-curve", box_fig, close=True)
-        self._log_scalar("Boxes/mAP", _safe_mean(box_ap))
+        self._log_scalar("Metric:Average-Precision/mAP", _safe_mean(mask_ap))
+        self._log_scalar("Metric:Global-Confluent-Instance-Recall/mGCIR", _safe_mean(mask_gcir))
+        self._log_scalar("Metric:Semantic-Mask/Dice", semantic_dice)
 
-        box_thresholds = metric_dict["box_cfm"].iou_thresholds
         self._log_cfm_series(
-            prefix="Boxes-IoU",
-            cfm=box_cfm,
-            iou_thresholds=box_thresholds,
-            ap_per_thr=box_ap if box_ap.numel() else None,
+            cfm=mask_cfm,
+            iou_thresholds=metric_dict["cfm"].iou_thresholds,
+            ap_per_thr=mask_ap if mask_ap.numel() else None,
+            gcir_per_thr=mask_gcir if mask_gcir.numel() else None,
         )
 
-        # ---------------- Masks ----------------
-        if len(metric_dict["mask_ap"].scores_all) > 0:
-            mask_cfm: Tensor = metric_dict["mask_cfm"].compute()  # [T,3]
-            mask_ap: Tensor = metric_dict["mask_ap"].compute()  # [T] or [T,...]
-            mask_gcir: Tensor = metric_dict["mask_gcir"].compute()
+        if self.trainer is not None and self.trainer.is_global_zero:
+            mask_plot_fn = getattr(metric_dict["ap"], "plot", None)
+            if callable(mask_plot_fn):
+                mask_fig, _ = mask_plot_fn()
+                self._log_figure("Metric:Figures/PR-curve", mask_fig, close=True)
 
-            mask_fig, _ = metric_dict["mask_ap"].plot()
+        froc = metric_dict["froc"]
+        curve = froc.compute()
+        auc = froc.auc(fppi_max=8.0)
+        ops = froc.sensitivity_at_fppi((0.5, 1, 2, 4, 8))
 
-            self._log_figure("Masks/PR-curve", mask_fig, close=True)
-            self._log_scalar("Masks/mAP", _safe_mean(mask_ap))
-            self._log_scalar("Masks/GCIR @ IoU=0.1", mask_gcir)
+        self._log_scalar("Metric:FROC/FROC_AUC@8", auc)
+        for fp, sens in ops.items():
+            self._log_scalar(f"Metric:FROC/Sens@FPPI{fp:g}", sens)
 
-            mask_thresholds = metric_dict["mask_cfm"].iou_thresholds
-            self._log_cfm_series(
-                prefix="Masks-IoU",
-                cfm=mask_cfm,
-                iou_thresholds=mask_thresholds,
-                ap_per_thr=mask_ap if mask_ap.numel() else None,
-            )
+        if self.trainer is not None and self.trainer.is_global_zero:
+            fig = plot_froc_curve(curve, fppi_max=8.0, title="Masks FROC @ IoU=0.10")
+            self._log_figure("Metric:Figures/FROC", fig, close=True)
 
-            mask_froc = metric_dict["mask_froc"]
-
-            curve = mask_froc.compute()  # {"thresholds","fppi","sensitivity"}
-            auc = mask_froc.auc(fppi_max=8.0)  # scalar tensor
-            ops = mask_froc.sensitivity_at_fppi((0.5, 1, 2, 4, 8))
-
-            # log scalar(s)
-            self._log_scalar("Masks/FROC_AUC@8", auc)
-
-            for fp, sens in ops.items():
-                self._log_scalar(f"Masks/Sens@FPPI{fp:g}", sens)
-
-            # plot + log figure
-            if self.trainer.is_global_zero:
-                fig = plot_froc_curve(curve, fppi_max=8.0, title="Masks FROC @ IoU=0.1")
-                self._log_figure("Masks/FROC", fig, close=True)
-
-        # ---------------- reset once ----------------
         metric_dict.reset()
 
-    # ---------------- Figure logging ----------------
     def _log_figure(self, name: str, fig, *, close: bool = True) -> None:
-        """
-        Logs a matplotlib figure to the active experiment logger (e.g. TensorBoard).
-        Only rank0 should create/submit figures to avoid duplicates.
-        """
         if not getattr(self.trainer, "is_global_zero", True):
             return
         if self.logger is None:
@@ -320,7 +293,6 @@ class ModelEvaluator(pl.LightningModule):
         if exp is None:
             return
 
-        # tensorboard SummaryWriter has add_figure
         add_figure = getattr(exp, "add_figure", None)
         if add_figure is None:
             return
@@ -334,30 +306,25 @@ class ModelEvaluator(pl.LightningModule):
             except Exception:
                 pass
 
-    # ---------------- scalar logging ----------------
     def _log_scalar(self, name: str, value: Tensor | float, *, sync_dist: bool = True) -> None:
-        """
-        Single place to control defaults.
-        IMPORTANT: logger=True forced here.
-        """
         self.log(
             name,
             _to_float(value),
             on_step=False,
             on_epoch=True,
             prog_bar=False,
-            logger=True,  # <-- forced TRUE
+            logger=True,
             batch_size=1,
             sync_dist=sync_dist,
         )
 
     @torch.no_grad()
     def _log_cfm_series(
-            self,
-            prefix: str,
-            cfm: Tensor,  # [T, 3] -> TP,FP,FN
-            iou_thresholds: Iterable[float],
-            ap_per_thr: Optional[Tensor] = None,  # [T] optional
+        self,
+        cfm: Tensor,
+        iou_thresholds: Iterable[float],
+        ap_per_thr: Optional[Tensor] = None,
+        gcir_per_thr: Optional[Tensor] = None,
     ) -> None:
         precision = compute_precision(cfm)
         recall = compute_recall(cfm)
@@ -368,17 +335,23 @@ class ModelEvaluator(pl.LightningModule):
             th_str = f"{float(th):.2f}"
 
             tp, fp, fn = cfm[i][0], cfm[i][1], cfm[i][2]
-            self._log_scalar(f"{prefix}/TP@{th_str}", tp)
-            self._log_scalar(f"{prefix}/FP@{th_str}", fp)
-            self._log_scalar(f"{prefix}/FN@{th_str}", fn)
+            self._log_scalar(f"Metric:True-Positives/TP@{th_str}", tp)
+            self._log_scalar(f"Metric:False-Positives/FP@{th_str}", fp)
+            self._log_scalar(f"Metric:False-Negatives/FN@{th_str}", fn)
 
-            self._log_scalar(f"{prefix}/Precision@{th_str}", precision[i])
-            self._log_scalar(f"{prefix}/Recall@{th_str}", recall[i])
-            self._log_scalar(f"{prefix}/F1@{th_str}", f1[i])
-            self._log_scalar(f"{prefix}/F2@{th_str}", f2[i])
+            self._log_scalar(f"Metric:Precision/Precision@{th_str}", precision[i])
+            self._log_scalar(f"Metric:Recall/Recall@{th_str}", recall[i])
+            self._log_scalar(f"Metric:F1-score/F1@{th_str}", f1[i])
+            self._log_scalar(f"Metric:F2-score/F2@{th_str}", f2[i])
 
             if ap_per_thr is not None:
-                # if ap_per_thr isn't 1D, best-effort take scalar per threshold
                 ap_i = ap_per_thr[i]
-                ap_i = ap_i.mean() if isinstance(ap_i, Tensor) and ap_i.numel() > 1 else ap_i
-                self._log_scalar(f"{prefix}/AP@{th_str}", ap_i)
+                if isinstance(ap_i, Tensor) and ap_i.numel() > 1:
+                    ap_i = ap_i.mean()
+                self._log_scalar(f"Metric:Average-Precision/AP@{th_str}", ap_i)
+
+            if gcir_per_thr is not None:
+                gcir_i = gcir_per_thr[i]
+                if isinstance(gcir_i, Tensor) and gcir_i.numel() > 1:
+                    gcir_i = gcir_i.mean()
+                self._log_scalar(f"Metric:Global-Confluent-Instance-Recall/GCIR@{th_str}", gcir_i)
