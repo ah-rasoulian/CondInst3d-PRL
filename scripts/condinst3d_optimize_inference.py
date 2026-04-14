@@ -8,6 +8,7 @@ import os
 import re
 import gc
 import fire
+import traceback
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 from omegaconf import open_dict
@@ -226,16 +227,16 @@ class HyperParamOptimizer:
         )
 
         params = {
-            "mask_thresh": trial.suggest_float("mask_thresh", 0.4, 0.6, step=0.05),
-            "nms_thresh": trial.suggest_float("nms_thresh", 0.2, 0.6, step=0.05),
+            "mask_thresh": trial.suggest_float("mask_thresh", 0.35, 0.65),
+            "nms_thresh": trial.suggest_float("nms_thresh", 0.2, 0.6),
         }
         if self.cfg.model.task_mode == "instance":
-            params["score_thresh"] = trial.suggest_float("score_thresh", 0.1, 0.6, step=0.05)
+            params["score_thresh"] = trial.suggest_float("score_thresh", 0.05, 0.6)
             if self.cfg.data.image_mode == "full":
-                params["topk_candidates"] = trial.suggest_int("topk_candidates", 20, 75, step=5)
+                params["topk_candidates"] = trial.suggest_int("topk_candidates", 15, 100)
             else:
-                params["topk_candidates"] = trial.suggest_int("topk_candidates", 5, 20, step=5)
-                params["group_thresh"] = trial.suggest_float("group_thresh", 0.4, 0.8, step=0.05)
+                params["topk_candidates"] = trial.suggest_int("topk_candidates", 5, 30)
+                params["group_thresh"] = trial.suggest_float("group_thresh", 0.35, 0.80)
 
         self._set_inference_params(params)
 
@@ -259,22 +260,27 @@ class HyperParamOptimizer:
 
             return float(metric_dict[self.metric_key])
 
+
+        # -------- OOM (expected failure) --------
         except torch.OutOfMemoryError as e:
-            print(f"[OOM] Trial failed for params={params}: {e}")
+            print(f"\`n[OOM] Trial failed for params={params}: {e}")
+            traceback.print_exc()
             trial.set_user_attr("oom", True)
+            raise optuna.exceptions.TrialPruned("Pruned due to CUDA OOM") from e
 
-            # cleanup
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-
-            raise optuna.exceptions.TrialPruned("Pruned due to CUDA OOM")
+        # -------- Any other failure --------
+        except Exception as e:
+            print(f"\n[ERROR] Trial failed for params={params}: {e}")
+            traceback.print_exc()
+            trial.set_user_attr("failed", True)
+            trial.set_user_attr("exception", str(e))
+            raise optuna.exceptions.TrialPruned("Pruned due to runtime error") from e
 
         finally:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
     def find_optimum(self, n_trials: int = 25, study_name: Optional[str] = None) -> Dict[str, Any]:
         sampler = optuna.samplers.TPESampler(seed=int(getattr(self.cfg.train, "seed", 1000)))
