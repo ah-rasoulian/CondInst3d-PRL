@@ -55,16 +55,17 @@ model:
     spatial_dims: 3
     in_channels: 4
     out_channels: 1
-    kernel_size: [ [ 3, 3, 1 ], [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 3 ], [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 1 ] ]
-    strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 1 ] ]
-    upsample_kernel_size: [ [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 1 ] ]
+    kernel_size: [ [ 3, 3, 1 ], [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 3 ], [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 3 ] ]
+    strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ] ]
+    upsample_kernel_size: [ [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ] ]
     filters: [ 24, 48, 96, 160, 224, 288, 384 ]
+    res_block: true
     heads_dim: 192
     decoder_strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 4, 4, 2 ], [ 8, 8, 4 ], [ 16, 16, 4 ], [ 32, 32, 8 ] ]
     head_indices: [ 2, 3, 4, 5 ]
 
   finetune:
-    backbone_ckpt: "outputs/dynunet_semantic_full/2026-03-27_22-50-13/tb/version_0/checkpoints/last.ckpt"
+    backbone_ckpt: null
 
   matcher:
     num_candidates: 25
@@ -141,7 +142,7 @@ model:
 
   optim:
     freeze_backbone: false
-    backbone_lr_mult: 0.05
+    backbone_lr_mult: 1.0
 
     optimizer:
       _target_: torch.optim.AdamW
@@ -167,7 +168,7 @@ model:
 
 data:
   image_mode: full   # patch or full
-  full_image_size: [192, 256, 72]
+  full_image_size: [192, 256, 80]
 
   root_path: "/scratch/04/public_datasets/nnDet/Task101_PRL"
   fold: 0
@@ -189,7 +190,7 @@ data:
   max_case_weight: 3.0
   train_num_samples: 2000
 
-  patch_size: [128, 192, 56]
+  patch_size: [128, 192, 48]
   patch_overlap: 0.5
 
   spatial_augmentation_prob: 0.25

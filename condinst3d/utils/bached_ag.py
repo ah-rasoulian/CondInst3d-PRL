@@ -90,9 +90,10 @@ def merge_patch_prediction(
     mask_thresh: float,
     group_iom_thresh: float,
     iom_chunk: int = 128,
+    topk_candidates: int = 100,
 ) -> Dict[str, Tensor]:
     """
-    Merge patch-level duplicate detections into full-image instance candidates.
+    Memory-efficient merge of patch-level duplicate detections into full-image instance candidates.
 
     Expected input keys
     -------------------
@@ -124,6 +125,147 @@ def merge_patch_prediction(
             "onehot_prob": torch.zeros((0, 1, X, Y, Z), device=device, dtype=torch.float32),
         }
 
+    def _to_offset_int_tensor(offsets_: Tensor) -> Tensor:
+        out = torch.as_tensor(
+            [_as_int_offset(of) for of in offsets_],
+            dtype=torch.long,
+            device=device,
+        )
+        if out.ndim != 2 or out.shape[1] != 3:
+            raise ValueError(f"Expected offsets of shape [M, 3], got {tuple(out.shape)}")
+        return out
+
+    def _compute_valid_crop_slices(
+        offset_xyz: Tensor,
+        patch_shape_xyz: Tuple[int, int, int],
+        output_shape_xyz: Tuple[int, int, int],
+    ):
+        """
+        Returns slices describing the valid overlap between a patch placed at offset_xyz
+        and the global output volume.
+
+        Coordinates are assumed to be [X, Y, Z].
+        """
+        px, py, pz = patch_shape_xyz
+        ox, oy, oz = [int(v) for v in offset_xyz.tolist()]
+        Xg, Yg, Zg = output_shape_xyz
+
+        gx0 = max(0, ox)
+        gy0 = max(0, oy)
+        gz0 = max(0, oz)
+
+        gx1 = min(Xg, ox + px)
+        gy1 = min(Yg, oy + py)
+        gz1 = min(Zg, oz + pz)
+
+        if gx1 <= gx0 or gy1 <= gy0 or gz1 <= gz0:
+            return None
+
+        lx0 = gx0 - ox
+        ly0 = gy0 - oy
+        lz0 = gz0 - oz
+
+        lx1 = lx0 + (gx1 - gx0)
+        ly1 = ly0 + (gy1 - gy0)
+        lz1 = lz0 + (gz1 - gz0)
+
+        return (gx0, gy0, gz0, gx1, gy1, gz1), (lx0, ly0, lz0, lx1, ly1, lz1)
+
+    def _global_bbox_from_local_bbox(
+        local_bbox_xyz: Tensor,
+        offset_xyz: Tensor,
+        patch_shape_xyz: Tuple[int, int, int],
+        output_shape_xyz: Tuple[int, int, int],
+    ) -> Tensor:
+        """
+        Shift local bbox to global space and clip to valid image bounds.
+        bbox format: [x0, y0, z0, x1, y1, z1]
+        """
+        crop_info = _compute_valid_crop_slices(offset_xyz, patch_shape_xyz, output_shape_xyz)
+        if crop_info is None:
+            return torch.zeros((6,), device=device, dtype=local_bbox_xyz.dtype)
+
+        (gx0v, gy0v, gz0v, gx1v, gy1v, gz1v), (lx0v, ly0v, lz0v, lx1v, ly1v, lz1v) = crop_info
+
+        gb = local_bbox_xyz.clone()
+        gb[:3] += offset_xyz.to(dtype=gb.dtype)
+        gb[3:] += offset_xyz.to(dtype=gb.dtype)
+
+        # clip to the valid pasted region for this patch
+        gb[0] = gb[0].clamp(min=gx0v, max=gx1v)
+        gb[1] = gb[1].clamp(min=gy0v, max=gy1v)
+        gb[2] = gb[2].clamp(min=gz0v, max=gz1v)
+        gb[3] = gb[3].clamp(min=gx0v, max=gx1v)
+        gb[4] = gb[4].clamp(min=gy0v, max=gy1v)
+        gb[5] = gb[5].clamp(min=gz0v, max=gz1v)
+
+        return gb
+
+    def _crop_local_mask_to_valid_global_extent(mask_1xyz: Tensor, offset_xyz: Tensor) -> Tensor:
+        """
+        Crop a local [1,px,py,pz] or [px,py,pz] mask to only the region that actually lands
+        inside the output image.
+        """
+        if mask_1xyz.ndim == 4:
+            mask_xyz = mask_1xyz[0]
+        else:
+            mask_xyz = mask_1xyz
+
+        px, py, pz = mask_xyz.shape
+        crop_info = _compute_valid_crop_slices(offset_xyz, (px, py, pz), output_shape)
+        if crop_info is None:
+            return mask_xyz.new_zeros((0, 0, 0), dtype=mask_xyz.dtype)
+
+        _, (lx0, ly0, lz0, lx1, ly1, lz1) = crop_info
+        return mask_xyz[lx0:lx1, ly0:ly1, lz0:lz1]
+
+    def _pairwise_iom_from_local_masks(
+        mask_i_1xyz: Tensor,
+        offset_i_xyz: Tensor,
+        area_i: Tensor,
+        bbox_i_xyz: Tensor,
+        mask_j_1xyz: Tensor,
+        offset_j_xyz: Tensor,
+        area_j: Tensor,
+        bbox_j_xyz: Tensor,
+    ) -> Tensor:
+        """
+        Compute IoM between two thresholded masks using only their overlapping global ROI.
+        No full-image materialization.
+        """
+        # intersection of clipped global boxes
+        sx = max(int(bbox_i_xyz[0].item()), int(bbox_j_xyz[0].item()))
+        sy = max(int(bbox_i_xyz[1].item()), int(bbox_j_xyz[1].item()))
+        sz = max(int(bbox_i_xyz[2].item()), int(bbox_j_xyz[2].item()))
+
+        ex = min(int(bbox_i_xyz[3].item()), int(bbox_j_xyz[3].item()))
+        ey = min(int(bbox_i_xyz[4].item()), int(bbox_j_xyz[4].item()))
+        ez = min(int(bbox_i_xyz[5].item()), int(bbox_j_xyz[5].item()))
+
+        if ex <= sx or ey <= sy or ez <= sz:
+            return torch.zeros((), device=device, dtype=torch.float32)
+
+        mi = mask_i_1xyz[0] if mask_i_1xyz.ndim == 4 else mask_i_1xyz
+        mj = mask_j_1xyz[0] if mask_j_1xyz.ndim == 4 else mask_j_1xyz
+
+        oi = [int(v) for v in offset_i_xyz.tolist()]
+        oj = [int(v) for v in offset_j_xyz.tolist()]
+
+        # global ROI -> local ROI for i
+        i_lx0, i_ly0, i_lz0 = sx - oi[0], sy - oi[1], sz - oi[2]
+        i_lx1, i_ly1, i_lz1 = ex - oi[0], ey - oi[1], ez - oi[2]
+
+        # global ROI -> local ROI for j
+        j_lx0, j_ly0, j_lz0 = sx - oj[0], sy - oj[1], sz - oj[2]
+        j_lx1, j_ly1, j_lz1 = ex - oj[0], ey - oj[1], ez - oj[2]
+
+        crop_i = mi[i_lx0:i_lx1, i_ly0:i_ly1, i_lz0:i_lz1]
+        crop_j = mj[j_lx0:j_lx1, j_ly0:j_ly1, j_lz0:j_lz1]
+
+        inter = (crop_i & crop_j).sum().to(torch.float32)
+        denom = torch.minimum(area_i, area_j).clamp_min(1.0)
+        return inter / denom
+
     # -------------------- empty input --------------------
     if det["scores"].numel() == 0:
         return _empty_output()
@@ -136,30 +278,20 @@ def merge_patch_prediction(
     if onehot_probs.ndim == 4:
         onehot_probs = onehot_probs.unsqueeze(1)  # [M,1,px,py,pz]
 
-    # -------------------- paste patch probabilities to global --------------------
-    onehot_probs_gb = torch.stack([
-        _place_patch_mask_into_global(oh, _as_int_offset(of), output_shape)
-        for oh, of in zip(onehot_probs, offsets)
-    ], dim=0)
+    # Keep local masks in local patch space
+    onehot_probs = onehot_probs.to(torch.float32)
+    onehot_bin = onehot_probs >= float(mask_thresh)  # [M,1,px,py,pz] bool
 
-    if onehot_probs_gb.ndim == 4:
-        onehot_probs_gb = onehot_probs_gb.unsqueeze(1)  # [M,1,X,Y,Z]
-
-    onehot_probs_gb = onehot_probs_gb.to(torch.float32)
-
-    # threshold only for geometry / grouping decisions
-    onehot_bin_gb = onehot_probs_gb >= float(mask_thresh)  # [M,1,X,Y,Z] bool
-
-    # -------------------- remove empty masks early --------------------
-    keep_nonempty = onehot_bin_gb[:, 0].flatten(1).any(dim=1)
+    # -------------------- remove empty masks early (local space) --------------------
+    keep_nonempty = onehot_bin[:, 0].flatten(1).any(dim=1)
     if not keep_nonempty.any():
         return _empty_output()
 
     scores = scores[keep_nonempty]
     classes = classes[keep_nonempty]
     offsets = offsets[keep_nonempty]
-    onehot_probs_gb = onehot_probs_gb[keep_nonempty]
-    onehot_bin_gb = onehot_bin_gb[keep_nonempty]
+    onehot_probs = onehot_probs[keep_nonempty]
+    onehot_bin = onehot_bin[keep_nonempty]
     anchor_centers = det["anchor_centers"][keep_nonempty] + offsets
     anchor_strides = det["anchor_strides"][keep_nonempty]
 
@@ -167,18 +299,72 @@ def merge_patch_prediction(
     if M == 0:
         return _empty_output()
 
-    # geometry from thresholded full-image masks
-    bboxes = get_onehot_instance_mask_boxes(onehot_bin_gb)  # [M,6]
-    centers = (bboxes[:, :3] + bboxes[:, 3:]) / 2.0
-    strides = (bboxes[:, 3:] - bboxes[:, :3]).clamp_min(1.0)
+    # -------------------- geometry from local masks --------------------
+    # local boxes in patch coordinates
+    local_bboxes = get_onehot_instance_mask_boxes(onehot_bin)  # [M,6]
+    offsets_int = _to_offset_int_tensor(offsets)
+
+    # clipped global boxes and valid clipped areas
+    global_bboxes: List[Tensor] = []
+    valid_areas: List[Tensor] = []
+
+    px, py, pz = onehot_bin.shape[-3:]
+    patch_shape = (px, py, pz)
+
+    for i in range(M):
+        gb = _global_bbox_from_local_bbox(
+            local_bbox_xyz=local_bboxes[i],
+            offset_xyz=offsets_int[i],
+            patch_shape_xyz=patch_shape,
+            output_shape_xyz=output_shape,
+        )
+        global_bboxes.append(gb)
+
+        cropped_mask = _crop_local_mask_to_valid_global_extent(onehot_bin[i], offsets_int[i])
+        area_i = cropped_mask.sum().to(torch.float32)
+        valid_areas.append(area_i)
+
+    global_bboxes = torch.stack(global_bboxes, dim=0)  # [M,6]
+    valid_areas = torch.stack(valid_areas, dim=0)      # [M]
+
+    # Remove masks that become empty after valid-image clipping
+    keep_valid = valid_areas > 0
+    if not keep_valid.any():
+        return _empty_output()
+
+    scores = scores[keep_valid]
+    classes = classes[keep_valid]
+    offsets = offsets[keep_valid]
+    offsets_int = offsets_int[keep_valid]
+    onehot_probs = onehot_probs[keep_valid]
+    onehot_bin = onehot_bin[keep_valid]
+    anchor_centers = anchor_centers[keep_valid]
+    anchor_strides = anchor_strides[keep_valid]
+    local_bboxes = local_bboxes[keep_valid]
+    global_bboxes = global_bboxes[keep_valid]
+    valid_areas = valid_areas[keep_valid]
+
+    M = int(scores.numel())
+    if M == 0:
+        return _empty_output()
+
+    centers = (global_bboxes[:, :3] + global_bboxes[:, 3:]) / 2.0
+    strides = (global_bboxes[:, 3:] - global_bboxes[:, :3]).clamp_min(1.0)
 
     if M == 1:
+        only_prob = _place_patch_mask_into_global(
+            onehot_probs[0], offsets_int[0], output_shape
+        ).to(torch.float32)
+
+        if only_prob.ndim == 3:
+            only_prob = only_prob.unsqueeze(0)
+
         return {
             "anchor_centers": anchor_centers,
             "anchor_strides": anchor_strides,
             "classes": classes,
             "scores": scores,
-            "onehot_prob": onehot_probs_gb,
+            "onehot_prob": only_prob.unsqueeze(0),  # [1,1,X,Y,Z]
         }
 
     # -------------------- Step 1: coarse grouping by proximity --------------------
@@ -211,9 +397,6 @@ def merge_patch_prediction(
     coarse_components = _find_connected_components(proximity_grouped)
 
     # -------------------- Step 2: refine each coarse group by IoM --------------------
-    flat = onehot_bin_gb[:, 0].flatten(1)              # [M,V] bool
-    area = flat.sum(dim=1).to(torch.float32)           # [M]
-
     out = {
         "anchor_centers": [],
         "anchor_strides": [],
@@ -225,11 +408,19 @@ def merge_patch_prediction(
     for group in coarse_components:
         if len(group) == 1:
             idx = int(group[0])
+
+            prob_gb = _place_patch_mask_into_global(
+                onehot_probs[idx], offsets_int[idx], output_shape
+            ).to(torch.float32)
+
+            if prob_gb.ndim == 3:
+                prob_gb = prob_gb.unsqueeze(0)  # [1,X,Y,Z]
+
             out["anchor_centers"].append(anchor_centers[idx])
             out["anchor_strides"].append(anchor_strides[idx])
             out["classes"].append(classes[idx])
             out["scores"].append(scores[idx])
-            out["onehot_prob"].append(onehot_probs_gb[idx])
+            out["onehot_prob"].append(prob_gb)
             continue
 
         gi = torch.as_tensor(group, device=device, dtype=torch.long)
@@ -242,19 +433,24 @@ def merge_patch_prediction(
             a = ii[s:s + iom_chunk]
             b = jj[s:s + iom_chunk]
 
-            mi = flat[gi[a]]  # [B,V]
-            mj = flat[gi[b]]  # [B,V]
+            for aa, bb in zip(a.tolist(), b.tolist()):
+                i = int(gi[aa].item())
+                j = int(gi[bb].item())
 
-            inter = (mi & mj).sum(dim=1).to(torch.float32)
-            denom = torch.minimum(area[gi[a]], area[gi[b]]).clamp_min(1.0)
-            iom = inter / denom
+                iom = _pairwise_iom_from_local_masks(
+                    mask_i_1xyz=onehot_bin[i],
+                    offset_i_xyz=offsets_int[i],
+                    area_i=valid_areas[i],
+                    bbox_i_xyz=global_bboxes[i],
+                    mask_j_1xyz=onehot_bin[j],
+                    offset_j_xyz=offsets_int[j],
+                    area_j=valid_areas[j],
+                    bbox_j_xyz=global_bboxes[j],
+                )
 
-            keep_edge = iom >= float(group_iom_thresh)
-            if keep_edge.any():
-                aa = a[keep_edge]
-                bb = b[keep_edge]
-                adj[aa, bb] = True
-                adj[bb, aa] = True
+                if iom >= float(group_iom_thresh):
+                    adj[aa, bb] = True
+                    adj[bb, aa] = True
 
         refined_local_components = _find_connected_components(adj)
 
@@ -265,8 +461,19 @@ def merge_patch_prediction(
 
             best_idx = idxs[torch.argmax(scores[idxs])]
 
-            # max-fusion preserves support across duplicates without blurring
-            group_prob = onehot_probs_gb[idxs].max(dim=0).values  # [1,X,Y,Z]
+            # Only materialize globals for this final refined component
+            comp_probs_gb = []
+            for idx in idxs.tolist():
+                prob_gb = _place_patch_mask_into_global(
+                    onehot_probs[idx], offsets_int[idx], output_shape
+                ).to(torch.float32)
+
+                if prob_gb.ndim == 3:
+                    prob_gb = prob_gb.unsqueeze(0)  # [1,X,Y,Z]
+
+                comp_probs_gb.append(prob_gb)
+
+            group_prob = torch.stack(comp_probs_gb, dim=0).max(dim=0).values  # [1,X,Y,Z]
 
             out["anchor_centers"].append(anchor_centers[best_idx])
             out["anchor_strides"].append(anchor_strides[best_idx])
@@ -277,12 +484,20 @@ def merge_patch_prediction(
     if len(out["scores"]) == 0:
         return _empty_output()
 
+    # stack only the lightweight tensors first
+    scores = torch.stack(out["scores"], dim=0)
+    k = min(int(topk_candidates), int(scores.numel()))
+    if k < int(scores.numel()):
+        keep = torch.topk(scores, k=k, largest=True, sorted=True).indices.tolist()
+    else:
+        keep = list(range(int(scores.numel())))
+
     return {
-        "anchor_centers": torch.stack(out["anchor_centers"], dim=0),
-        "anchor_strides": torch.stack(out["anchor_strides"], dim=0),
-        "classes": torch.stack(out["classes"], dim=0),
-        "scores": torch.stack(out["scores"], dim=0),
-        "onehot_prob": torch.stack(out["onehot_prob"], dim=0),
+        "anchor_centers": torch.stack([out["anchor_centers"][i] for i in keep], dim=0),
+        "anchor_strides": torch.stack([out["anchor_strides"][i] for i in keep], dim=0),
+        "classes": torch.stack([out["classes"][i] for i in keep], dim=0),
+        "scores": torch.stack([out["scores"][i] for i in keep], dim=0),
+        "onehot_prob": torch.stack([out["onehot_prob"][i] for i in keep], dim=0),
     }
 
 def batched_nms(

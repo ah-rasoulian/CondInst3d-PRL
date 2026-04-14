@@ -47,7 +47,7 @@ train:
 
 model:
   task_mode: instance
-  forward_chunk_size: 12
+  forward_chunk_size: 4
   max_mask_to_train: 128
 
   backbone:
@@ -87,7 +87,7 @@ model:
       num_layers: 3
       kernel_size: 1
       size_of_interest: 4
-      max_batch_size: 16
+      max_batch_size: 8
 
   losses:
     classification:

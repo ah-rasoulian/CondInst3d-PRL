@@ -4,7 +4,7 @@ from monai.data import MetaTensor
 from typing import List, Sequence, Tuple, Optional, Union, Dict, Any, Literal, Callable
 
 
-def mask_intersection_over_union(preds: torch.Tensor, targets: torch.Tensor, max_chunk_size=40):
+def mask_intersection_over_union(preds: torch.Tensor, targets: torch.Tensor, max_chunk_size=24):
     """
     Calculate IoU between prediction and target masks in chunks to avoid CUDA OOM.
     preds: predicted 3D masks [N, D, H, W] where N is number of instances
@@ -39,7 +39,7 @@ def mask_intersection_over_union(preds: torch.Tensor, targets: torch.Tensor, max
     return iou_matrix
 
 
-def mask_intersection_over_minimum(preds: torch.Tensor, targets: torch.Tensor, max_chunk_size=40):
+def mask_intersection_over_minimum(preds: torch.Tensor, targets: torch.Tensor, max_chunk_size=24):
     """
     Calculate IoM (intersection over minimum) between prediction and target masks in chunks to avoid CUDA OOM.
     preds: predicted 3D masks [N, D, H, W] where N is number of instances
