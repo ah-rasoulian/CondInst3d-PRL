@@ -132,7 +132,6 @@ class DynUNetBackboneSpecificMod(DynUNetBackbone):
             norm_name=norm_name,
             act_name=act_name,
             dropout=dropout,
-            trans_bias=trans_bias,
         )
 
     def _forward_encoder(self, x: Tensor) -> tuple[List[Tensor], Tensor]:
