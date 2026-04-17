@@ -1,0 +1,156 @@
+train:
+  seed: 1000
+  deterministic: false
+  rlimit_nofile: 1048576
+  resume: null
+
+  output_root: outputs
+
+  logger:
+    _target_: pytorch_lightning.loggers.TensorBoardLogger
+    save_dir: null
+    name: tb
+    version: null
+    default_hp_metric: false
+
+  logger_layout:
+    add_custom_scalars: true
+    iou_thresholds: [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+
+  # optional: override defaults
+  monitor: "Validation/mAP"
+  monitor_mode: "max"
+  save_top_k: 3
+  save_last: true
+  ckpt_filename: "best_{epoch}-{step}"
+  ckpt_every_n_epochs: 1
+  lr_logging_interval: "step"
+
+  # DDP defaults (used if train.strategy not provided)
+  ddp_backend: "nccl"
+
+  trainer:
+    use_distributed_sampler: false
+    accelerator: gpu
+    devices: [0, 1, 2, 3]
+    precision: bf16-mixed
+    max_epochs: 200
+    gradient_clip_algorithm: norm
+    gradient_clip_val: 0.5
+    accumulate_grad_batches: 1
+    num_sanity_val_steps: 0
+    check_val_every_n_epoch: 10
+    log_every_n_steps: 1
+    limit_train_batches: 1.0
+    limit_val_batches: 1.0
+    enable_progress_bar: true
+    enable_model_summary: true
+
+model:
+  task_mode: semantic
+  forward_chunk_size: 12
+  max_mask_to_train: 160
+
+  backbone:
+    _target_: condinst3d.arch.backbone.dynunet_specificmod.DynUNetBackboneSpecificMod
+    specific_modality_index: 3
+    spatial_dims: 3
+    in_channels: 4
+    out_channels: 1
+    kernel_size: [ [ 3, 3, 1 ], [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 3 ], [ 3, 3, 1 ], [ 3, 3, 3 ], [ 3, 3, 1 ] ]
+    strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 1 ] ]
+    upsample_kernel_size: [ [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 2 ], [ 2, 2, 1 ], [ 2, 2, 2 ], [ 2, 2, 1 ] ]
+    filters: [ 24, 48, 96, 160, 224, 288, 384 ]
+    heads_dim: 192
+    decoder_strides: [ [ 1, 1, 1 ], [ 2, 2, 1 ], [ 4, 4, 2 ], [ 8, 8, 4 ], [ 16, 16, 4 ], [ 32, 32, 8 ] ]
+    head_indices: [ 2, 3, 4, 5 ]
+
+  finetune:
+    backbone_ckpt: null
+
+  losses:
+    semantic_segmentation:
+      _target_: condinst3d.losses.generalized_dice_bce.GeneralizedDiceBCELoss
+      include_background: true
+      sigmoid: true
+      softmax: false
+      w_type: square
+      smooth_nr: 1e-5
+      smooth_dr: 1e-5
+      lambda_gdice: 1.0
+      lambda_bce: 0.5
+      pos_weight: 5.0
+      reduction: mean
+
+  inference:
+    mask_thresh: 0.5
+    nms_thresh: 0.5
+
+  evaluation:
+    iou_list: [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+    ap_n_interp: 101
+
+  visualization:
+    img_channels: ['t1w', 't2w', 'flr', 'freqmap']
+    channel_seg_under_image: 3
+    crop_size: [96, 96]
+    show_slices: [-1, 0, 1]
+    figsize: 1.5
+    num_train_images_to_show: 5
+    num_val_images_to_show: 15
+
+  optim:
+    freeze_backbone: false
+    backbone_lr_mult: 1.0
+
+    optimizer:
+      _target_: torch.optim.AdamW
+      lr: 8e-4
+      weight_decay: 1e-4
+      betas: [ 0.9, 0.99 ]
+
+    scheduler:
+      _target_: torch.optim.lr_scheduler.SequentialLR
+      schedulers:
+        - _target_: torch.optim.lr_scheduler.LinearLR
+          start_factor: 0.2
+          total_iters: 10
+        - _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+          T_max: 190
+          eta_min: 1e-5
+      milestones: [ 10 ]
+
+    scheduler_cfg:
+      interval: epoch
+      frequency: 1
+      name: lr
+
+data:
+  image_mode: patch   # patch or full
+  full_image_size: [192, 256, 72]
+
+  root_path: "/scratch/04/public_datasets/nnDet/Task101_PRL"
+  fold: 0
+  modalities: ['t1w', 't2w', 'flr', 'freqmap']
+  splits_path: "/scratch/04/public_datasets/nnDet/Task101_PRL/preprocessed/splits_final.pkl"
+
+  num_workers:
+    train: 16
+    val: 8
+    test: 8
+
+  batch_size:
+    train: 2
+    val: 1
+    test: 1
+
+  empty_case_weight: 0.2
+  instance_weight_power: 0.5
+  max_case_weight: 3.0
+  train_num_samples: 2000
+
+  patch_size: [128, 192, 56]
+  patch_overlap: 0.5
+
+  spatial_augmentation_prob: 0.25
+  intensity_augmentation_prob: 0.25
