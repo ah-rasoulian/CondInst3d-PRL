@@ -7,6 +7,7 @@ from typing import List, Union, Tuple
 from torch import Tensor
 from collections import defaultdict
 from torch.utils.checkpoint import checkpoint
+from monai.data import MetaTensor
 
 
 class DynamicMaskHead(nn.Module):
@@ -144,6 +145,9 @@ class DynamicMaskHead(nn.Module):
         Returns:
             mask_logits: [M, 1, W, H, D] where M = number of sampled instances
         """
+        if isinstance(f_mask, MetaTensor):
+            f_mask = f_mask.as_tensor()
+
         B, C, W, H, D = f_mask.shape
         n_inst = len(instance_list)
 
@@ -176,6 +180,8 @@ class DynamicMaskHead(nn.Module):
         for img_idx, inst_ids_list in per_image_indices.items():
             inst_ids_all = torch.as_tensor(inst_ids_list, device=device, dtype=torch.long)
             feat_img = f_mask[img_idx:img_idx + 1]  # [1, C, W, H, D]
+            if isinstance(feat_img, MetaTensor):
+                feat_img = feat_img.as_tensor()
 
             for start in range(0, len(inst_ids_list), self.max_batch_size):
                 end = min(start + self.max_batch_size, len(inst_ids_list))
@@ -193,8 +199,8 @@ class DynamicMaskHead(nn.Module):
                 # expand image feature instead of fancy indexing from full batch repeatedly
                 feat = feat_img.expand(bs, -1, -1, -1, -1)      # [bs, C, W, H, D]
 
-                # concat once for this chunk
-                mask_in = torch.cat((feat, rel), dim=1).reshape(1, bs * (C + 3), W, H, D)
+                mask_in = torch.cat((feat, rel), dim=1)
+                mask_in = mask_in.reshape(1, bs * (C + 3), W, H, D).contiguous()
 
                 weights, biases = self.parse_dynamic_params(mask_head_params[inst_ids])
                 mask_logits = self.mask_heads_forward(mask_in, weights, biases, bs)  # [1, bs, W, H, D]
@@ -203,5 +209,8 @@ class DynamicMaskHead(nn.Module):
 
                 # aggressively drop refs
                 del pts, soi_bs, rel, feat, mask_in, weights, biases, mask_logits
+
+                if not self.training:
+                    torch.cuda.empty_cache()
 
         return out

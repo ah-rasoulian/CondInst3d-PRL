@@ -87,7 +87,7 @@ model:
       num_layers: 3
       kernel_size: 1
       size_of_interest: 4
-      max_batch_size: 8
+      max_batch_size: 4
 
   losses:
     classification:

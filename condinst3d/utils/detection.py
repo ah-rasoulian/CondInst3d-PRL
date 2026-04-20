@@ -188,7 +188,8 @@ class InstanceList:
         return: [M, P] for sampled instances
         """
         s = self.sample_idx
-        return controller_logits[self.img_idx[s], self.anchor_idx[s]]
+        device = controller_logits.device
+        return controller_logits[self.img_idx[s].to(device=device), self.anchor_idx[s].to(device=device)]
 
     def get_gt_mask(self, targets: List[Dict[str, Tensor]], dtype=torch.float32) -> Tensor:
         """

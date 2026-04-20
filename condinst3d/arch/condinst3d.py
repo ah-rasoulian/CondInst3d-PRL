@@ -590,7 +590,7 @@ class CondInst3d(pl.LightningModule):
             "semantic_output": MetaTensor(semantic_output, meta=input_meta),
             "semantic_logits": MetaTensor(semantic_logits, meta=input_meta),
             "decoder_outputs": [
-                torch.cat([c["decoder_outputs"][j] for c in chunked_outputs], dim=0)
+                torch.cat([c["decoder_outputs"][j].to("cpu") for c in chunked_outputs], dim=0)
                 for j in range(self.backbone.num_decoder_levels)
             ],
             "offsets": metadata.get("offsets", None),
@@ -603,7 +603,7 @@ class CondInst3d(pl.LightningModule):
             num_head_levels = len(self.backbone.head_indices)
 
             outputs["features"] = [
-                torch.cat([c["features"][j] for c in chunked_outputs], dim=0)
+                torch.cat([c["features"][j].detach().to("cpu") for c in chunked_outputs], dim=0)
                 for j in range(num_head_levels)
             ]
             outputs["cls_logits"] = torch.cat(
@@ -611,7 +611,7 @@ class CondInst3d(pl.LightningModule):
                 dim=0,
             )
             outputs["controller_logits"] = torch.cat(
-                [c["controller_logits"] for c in chunked_outputs],
+                [c["controller_logits"].to("cpu") for c in chunked_outputs],
                 dim=0,
             )
 
@@ -1634,9 +1634,7 @@ class CondInst3d(pl.LightningModule):
 
             metric_dict["semantic_dice"].update(semantic_pred, semantic_gt)
 
-            pairwise_mask_iou = mask_intersection_over_union(
-                pred_onehot, gt_onehot, max_chunk_size=32
-            )
+            pairwise_mask_iou = mask_intersection_over_union(pred_onehot, gt_onehot)
             metric_dict["cfm"].update(pairwise_mask_iou, scores)
             metric_dict["ap"].update(pairwise_mask_iou, scores)
 
